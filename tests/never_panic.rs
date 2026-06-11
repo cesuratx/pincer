@@ -64,6 +64,16 @@ proptest! {
         decode_frame(&frame);
     }
 
+    /// Same property, but past the magic check: a pcapng SHB type prefix puts
+    /// the fuzz inside the section/block parsing machinery instead of
+    /// stopping at magic rejection.
+    #[test]
+    fn arbitrary_pcapng_section_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        let mut file = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        file.extend_from_slice(&bytes);
+        run_pipeline(&file);
+    }
+
     /// Fuzz the application sniffers directly on arbitrary payloads — the
     /// loop-prone parsers (DNS name decompression, TLS/DHCP option walks) get
     /// their most direct adversarial exposure here, below the packet framing.

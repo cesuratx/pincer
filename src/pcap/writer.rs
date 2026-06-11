@@ -36,7 +36,11 @@ impl<W: Write> PcapWriter<W> {
             u32::try_from(ts.secs).map_err(|_| io::Error::other("timestamp beyond u32 seconds"))?;
 
         self.writer.write_all(&ts_sec.to_le_bytes())?;
-        self.writer.write_all(&(ts.nanos / 1000).to_le_bytes())?;
+        // Belt-and-braces: Timestamp::new normalizes nanos < 1e9, but the
+        // fields are pub — clamp so an unnormalized value cannot produce a
+        // spec-invalid microsecond field (>= 1_000_000).
+        self.writer
+            .write_all(&(ts.nanos.min(999_999_999) / 1000).to_le_bytes())?;
         self.writer.write_all(&len.to_le_bytes())?; // incl_len
         self.writer.write_all(&len.to_le_bytes())?; // orig_len
         self.writer.write_all(frame)

@@ -77,6 +77,9 @@ pub struct CaptureReader<R> {
     buf: Vec<u8>,
     /// Byte offset into the file, for error reporting.
     offset: u64,
+    /// Well-framed packet blocks skipped because their body was malformed
+    /// (pcapng only). Surfaced so damaged input is never silently dropped.
+    skipped_blocks: u64,
 }
 
 impl<R: Read> CaptureReader<R> {
@@ -85,18 +88,27 @@ impl<R: Read> CaptureReader<R> {
         let mut magic = [0u8; 4];
         reader
             .read_exact(&mut magic)
-            .map_err(|_| PcapError::TruncatedFile {
-                context: "file magic",
+            .map_err(|err| match err.kind() {
+                // Only a genuinely short file is "truncated"; a permission or
+                // device error must say what it actually was.
+                std::io::ErrorKind::UnexpectedEof => PcapError::TruncatedFile {
+                    context: "file magic",
+                },
+                _ => PcapError::Io(err),
             })?;
 
-        let format = match magic {
+        let (format, header_len) = match magic {
             legacy::MAGIC_BE_US
             | legacy::MAGIC_LE_US
             | legacy::MAGIC_BE_NS
-            | legacy::MAGIC_LE_NS => {
-                Format::Legacy(legacy::State::read_header(&mut reader, magic)?)
+            | legacy::MAGIC_LE_NS => (
+                Format::Legacy(legacy::State::read_header(&mut reader, magic)?),
+                24, // 4 magic + 20 global header
+            ),
+            pcapng::BLOCK_SHB_BYTES => {
+                let (state, shb_len) = pcapng::State::read_section_header(&mut reader)?;
+                (Format::Ng(state), shb_len)
             }
-            pcapng::BLOCK_SHB_BYTES => Format::Ng(pcapng::State::read_section_header(&mut reader)?),
             other => return Err(PcapError::BadMagic(other)),
         };
 
@@ -104,8 +116,18 @@ impl<R: Read> CaptureReader<R> {
             reader,
             format,
             buf: Vec::new(),
-            offset: 24, // both headers consumed ≥ this; refined per-format below
+            // Exact bytes consumed so far, so error offsets are accurate for
+            // both formats (a pcapng SHB is 28+ bytes, not 24).
+            offset: header_len,
+            skipped_blocks: 0,
         })
+    }
+
+    /// Packet blocks whose framing was valid but whose body was malformed;
+    /// each was skipped (counted, never aborting the stream).
+    #[must_use]
+    pub fn skipped_blocks(&self) -> u64 {
+        self.skipped_blocks
     }
 
     /// Next packet, or `Ok(None)` at clean end-of-file.
@@ -114,9 +136,12 @@ impl<R: Read> CaptureReader<R> {
             Format::Legacy(state) => {
                 state.next_record(&mut self.reader, &mut self.buf, &mut self.offset)
             }
-            Format::Ng(state) => {
-                state.next_record(&mut self.reader, &mut self.buf, &mut self.offset)
-            }
+            Format::Ng(state) => state.next_record(
+                &mut self.reader,
+                &mut self.buf,
+                &mut self.offset,
+                &mut self.skipped_blocks,
+            ),
         }
     }
 }

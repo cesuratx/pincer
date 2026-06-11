@@ -228,3 +228,236 @@ fn ipv6_flow_flood_respects_cap() {
     }
     assert_eq!(flows.len(), 8);
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial *container* tests: pcapng framing attacks. The block-length
+// field drives buffer sizing and stream advancement, so lies here are how a
+// hostile file tries to hang the reader, force a giant allocation, or
+// silently truncate the analysis.
+// ---------------------------------------------------------------------------
+
+mod pcapng_hostile {
+    use pincer::error::PcapError;
+    use pincer::pcap::CaptureReader;
+
+    /// Minimal little-endian SHB (28 bytes, no options).
+    fn shb_le() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&(-1i64).to_le_bytes());
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b
+    }
+
+    /// A block whose header *claims* `total_len`, regardless of the body.
+    fn lying_block(block_type: u32, total_len: u32, body: &[u8]) -> Vec<u8> {
+        let mut b = block_type.to_le_bytes().to_vec();
+        b.extend_from_slice(&total_len.to_le_bytes());
+        b.extend_from_slice(body);
+        b
+    }
+
+    #[test]
+    fn block_length_lies_are_rejected_not_hung() {
+        // 0 and 4 would make the stream go backwards; 8 and 11 are below the
+        // 12-byte framing minimum; 13 and 14 break 4-alignment. Every one
+        // must be a BadLength error — not an infinite loop, not a panic, and
+        // not a silent EOF.
+        for lie in [0u32, 4, 8, 11, 13, 14] {
+            let mut file = shb_le();
+            file.extend_from_slice(&lying_block(6, lie, &[0u8; 64]));
+            let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+            let err = reader.next_record().expect_err("length lie must error");
+            assert!(
+                matches!(err, PcapError::BadLength { len, .. } if len == u64::from(lie)),
+                "total_len {lie}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn giant_block_length_is_rejected_without_allocation() {
+        // 4-aligned and well-formed framing, but claims a ~4 GiB body. The
+        // 64 MiB record cap must reject it before any buffer is sized by it.
+        let mut file = shb_le();
+        file.extend_from_slice(&lying_block(6, 0xFFFF_FFF0, &[0u8; 16]));
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let err = reader.next_record().expect_err("giant length must error");
+        assert!(matches!(err, PcapError::BadLength { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn truncated_mid_block_is_truncation_not_panic() {
+        // A block header promising more bytes than the file has: the typical
+        // cut-off-mid-write capture. Must surface as TruncatedFile so the
+        // caller can flag the tail, never a panic or a hang.
+        let mut file = shb_le();
+        file.extend_from_slice(&lying_block(6, 64, &[0u8; 10])); // 42 bytes short
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let err = reader.next_record().expect_err("must error");
+        assert!(
+            matches!(err, PcapError::TruncatedFile { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn big_endian_section_parses() {
+        // Endianness comes from the BOM per section; a big-endian file is
+        // valid input, not an anomaly.
+        let mut file = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        file.extend_from_slice(&28u32.to_be_bytes());
+        file.extend_from_slice(&0x1A2B_3C4Du32.to_be_bytes());
+        file.extend_from_slice(&1u16.to_be_bytes());
+        file.extend_from_slice(&0u16.to_be_bytes());
+        file.extend_from_slice(&(-1i64).to_be_bytes());
+        file.extend_from_slice(&28u32.to_be_bytes());
+        // IDB: Ethernet, snaplen 0.
+        file.extend_from_slice(&1u32.to_be_bytes());
+        file.extend_from_slice(&20u32.to_be_bytes());
+        file.extend_from_slice(&1u16.to_be_bytes());
+        file.extend_from_slice(&0u16.to_be_bytes());
+        file.extend_from_slice(&0u32.to_be_bytes());
+        file.extend_from_slice(&20u32.to_be_bytes());
+        // EPB with 4 data bytes.
+        file.extend_from_slice(&6u32.to_be_bytes());
+        file.extend_from_slice(&36u32.to_be_bytes());
+        for field in [0u32, 0, 0, 4, 4] {
+            file.extend_from_slice(&field.to_be_bytes());
+        }
+        file.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        file.extend_from_slice(&36u32.to_be_bytes());
+
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let record = reader.next_record().unwrap().expect("one packet");
+        assert_eq!(record.data, &[0xCA, 0xFE, 0xBA, 0xBE]);
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn idb_option_length_lie_does_not_hang_or_poison_the_section() {
+        // IDB whose if_tsresol option claims 0xFFFF value bytes that are not
+        // there. Option walking must stop; the packet block after it must
+        // still decode under the interface's defaults.
+        let mut file = shb_le();
+        let mut idb_body = Vec::new();
+        idb_body.extend_from_slice(&1u16.to_le_bytes()); // Ethernet
+        idb_body.extend_from_slice(&0u16.to_le_bytes());
+        idb_body.extend_from_slice(&0u32.to_le_bytes()); // snaplen: no limit
+        idb_body.extend_from_slice(&9u16.to_le_bytes()); // if_tsresol
+        idb_body.extend_from_slice(&0xFFFFu16.to_le_bytes()); // length lie
+        let total = u32::try_from(idb_body.len()).unwrap() + 12;
+        file.extend_from_slice(&1u32.to_le_bytes());
+        file.extend_from_slice(&total.to_le_bytes());
+        file.extend_from_slice(&idb_body);
+        file.extend_from_slice(&total.to_le_bytes());
+        // Valid EPB.
+        file.extend_from_slice(&6u32.to_le_bytes());
+        file.extend_from_slice(&36u32.to_le_bytes());
+        for field in [0u32, 0, 0, 4, 4] {
+            file.extend_from_slice(&field.to_le_bytes());
+        }
+        file.extend_from_slice(&[1, 2, 3, 4]);
+        file.extend_from_slice(&36u32.to_le_bytes());
+
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let record = reader.next_record().unwrap().expect("EPB must survive");
+        assert_eq!(record.data, &[1, 2, 3, 4]);
+    }
+}
+
+mod pcapng_framing {
+    use pincer::error::PcapError;
+    use pincer::pcap::CaptureReader;
+
+    fn shb_le() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&(-1i64).to_le_bytes());
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b
+    }
+
+    fn idb_le() -> Vec<u8> {
+        let mut b = 1u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b
+    }
+
+    fn epb_le(iface: u32, data: &[u8]) -> Vec<u8> {
+        let cap = u32::try_from(data.len()).unwrap();
+        let padded = data.len().next_multiple_of(4);
+        let total = u32::try_from(32 + padded).unwrap();
+        let mut b = 6u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&total.to_le_bytes());
+        for field in [iface, 0, 0, cap, cap] {
+            b.extend_from_slice(&field.to_le_bytes());
+        }
+        b.extend_from_slice(data);
+        b.resize(b.len() + (padded - data.len()), 0);
+        b.extend_from_slice(&total.to_le_bytes());
+        b
+    }
+
+    /// A trailing Block Total Length that disagrees with the leading one means
+    /// the framing itself is corrupt — the stream must stop with an error, not
+    /// keep walking on a length it now knows is untrustworthy.
+    #[test]
+    fn trailing_length_mismatch_is_fatal_framing_damage() {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        let mut epb = epb_le(0, &[1, 2, 3, 4]);
+        let n = epb.len();
+        epb.get_mut(n - 4..)
+            .unwrap()
+            .copy_from_slice(&999u32.to_le_bytes()); // corrupt trailer
+        file.extend_from_slice(&epb);
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let err = reader.next_record().expect_err("mismatch must error");
+        assert!(
+            matches!(err, PcapError::BadLength { len: 999, .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// An EPB naming an interface the section never declared must be skipped
+    /// and counted — not silently decoded under a guessed default interface
+    /// (wrong link type, wrong clock).
+    #[test]
+    fn epb_with_undeclared_interface_is_skipped_and_counted() {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le()); // declares interface 0 only
+        file.extend_from_slice(&epb_le(7, &[1, 2, 3, 4])); // references 7
+        file.extend_from_slice(&epb_le(0, &[5, 6, 7, 8])); // valid
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let rec = reader.next_record().unwrap().expect("valid EPB survives");
+        assert_eq!(rec.data, &[5, 6, 7, 8]);
+        assert!(reader.next_record().unwrap().is_none());
+        assert_eq!(reader.skipped_blocks(), 1);
+    }
+
+    /// An IDB flood must not grow memory without bound: past the cap the
+    /// definitions are skipped and counted.
+    #[test]
+    fn idb_flood_is_capped_not_unbounded() {
+        let mut file = shb_le();
+        for _ in 0..5000 {
+            file.extend_from_slice(&idb_le());
+        }
+        file.extend_from_slice(&epb_le(0, &[9, 9, 9, 9]));
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let rec = reader.next_record().unwrap().expect("packet still decodes");
+        assert_eq!(rec.data, &[9, 9, 9, 9]);
+        assert_eq!(reader.skipped_blocks(), 5000 - 4096, "overflow counted");
+    }
+}
