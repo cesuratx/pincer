@@ -15,7 +15,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use pincer::analysis::{AssetInventory, FlowTable, Observe, Stats};
-use pincer::app::{dhcp, dns, sniff};
+use pincer::app::{SniffDepth, dhcp, dns, sniff, sniff_with};
 use pincer::decode::decode_packet;
 use pincer::fixtures::{self, Packet, scenarios};
 use pincer::pcap::{LinkType, Record};
@@ -261,6 +261,95 @@ proptest! {
         let summary = dhcp::parse(&payload).expect("valid DHCP parses");
         let expected = codes.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
         prop_assert_eq!(summary.fingerprint(), expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sniff-depth invariants: the label-only mode may skip allocations, never
+// change a verdict
+// ---------------------------------------------------------------------------
+
+/// The depth hint must never change which packets get an app event, the
+/// label, or the server-name hint — only how much detail is materialized.
+/// The sample scenarios carry DNS, mDNS, DHCP, HTTP, and TLS traffic.
+#[test]
+fn label_only_sniff_agrees_with_full_sniff() {
+    let label_only = SniffDepth {
+        dns_detail: false,
+        dhcp_detail: false,
+    };
+    let frames: Vec<_> = scenarios::office()
+        .into_iter()
+        .chain(scenarios::incident())
+        .collect();
+    let mut events = 0u32;
+    for (ts, frame) in &frames {
+        let record = Record {
+            ts: Some(*ts),
+            orig_len: u32::try_from(frame.len()).unwrap(),
+            link_type: LinkType::Ethernet,
+            data: frame,
+        };
+        let Ok(pkt) = decode_packet(&record) else {
+            continue;
+        };
+        let full = sniff(&pkt);
+        let shallow = sniff_with(&pkt, label_only);
+        assert_eq!(full.is_some(), shallow.is_some(), "verdict must not move");
+        if let (Some(full), Some(shallow)) = (full, shallow) {
+            events += 1;
+            assert_eq!(full.label(), shallow.label());
+            assert_eq!(full.server_name_hint(), shallow.server_name_hint());
+        }
+    }
+    assert!(events > 0, "scenarios must exercise app events");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Validation-only DNS/DHCP parses must agree with the full parse on
+    /// accept/reject for arbitrary (hostile) payloads.
+    #[test]
+    fn shallow_parsers_agree_with_full_on_arbitrary_bytes(
+        payload in proptest::collection::vec(any::<u8>(), 0..1024)
+    ) {
+        for is_mdns in [false, true] {
+            let full = dns::parse(&payload, is_mdns);
+            let shallow = dns::parse_shallow(&payload, is_mdns);
+            prop_assert_eq!(full.is_some(), shallow.is_some());
+            if let (Some(full), Some(shallow)) = (full, shallow) {
+                prop_assert_eq!(full.id, shallow.id);
+                prop_assert_eq!(full.is_response, shallow.is_response);
+                prop_assert_eq!(full.is_mdns, shallow.is_mdns);
+            }
+        }
+        prop_assert_eq!(
+            dhcp::parse(&payload).is_some(),
+            dhcp::parse_shallow(&payload).is_some()
+        );
+    }
+
+    /// Same agreement under structure-aware mutation: start from a valid
+    /// compressed DNS response and flip one byte — mutants explore the
+    /// accept/reject boundary far more densely than random bytes do.
+    #[test]
+    fn shallow_dns_agrees_with_full_under_mutation(
+        idx in 0usize..128,
+        flip in 1u8..,
+    ) {
+        let mut msg =
+            fixtures::dns_response_a(7, "mutation-host.local", Ipv4Addr::new(10, 0, 0, 9));
+        if let Some(byte) = msg.get_mut(idx) {
+            *byte ^= flip;
+        }
+        for is_mdns in [false, true] {
+            prop_assert_eq!(
+                dns::parse(&msg, is_mdns).is_some(),
+                dns::parse_shallow(&msg, is_mdns).is_some(),
+                "mutant at byte {} must not split the parsers", idx
+            );
+        }
     }
 }
 

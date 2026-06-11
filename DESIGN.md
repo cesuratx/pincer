@@ -261,7 +261,16 @@ candidates in order, cheapest discriminator first, stopping at the first match.
 
 **Solution:** [`app::sniff`](src/app/mod.rs) tries sniffers in sequence; each
 does a cheap structural pre-check and returns `Option`, so `None` falls through
-to the next. UDP dispatches by port; TCP by content (`tls.or_else(|| http)`).
+to the next. UDP dispatches by port; TCP by content (`tls.or_else(|| http)` —
+HTTP itself gates on a method-prefix check before any payload scan, so bulk
+non-HTTP TCP rejects in O(8) bytes).
+
+The CLI threads a *depth hint* (`SniffDepth`) into the dispatch: `flows` and
+`summary` consume only the event label, so for them the DNS/DHCP sniffers run
+validation-only — the payload is walked with exactly the same bounds and caps
+(accept/reject, and therefore the label, cannot diverge; a property test pins
+this) but no query/answer/option detail is allocated. Sinks that read the
+detail (`assets`, `dns`, `dhcp`) keep the full parse.
 
 ### 5.7 Strategy (output rendering)
 

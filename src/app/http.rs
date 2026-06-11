@@ -25,6 +25,14 @@ pub struct HttpRequest {
 /// `None` = does not look like an HTTP request.
 #[must_use]
 pub fn parse_request(payload: &[u8]) -> Option<HttpRequest> {
+    // Method prefix first: O(8) against the first bytes, before the 2 KiB
+    // window scan and the UTF-8 validation. Bulk non-HTTP TCP segments — the
+    // dominant byte volume in real captures — reject right here. A request
+    // the parse below would accept always starts `METHOD SP`, so this gate
+    // changes no verdict.
+    if !starts_with_method(payload) {
+        return None;
+    }
     let window = payload.get(..payload.len().min(SCAN_LIMIT))?;
     // Bound the UTF-8 requirement to the *header* region (up to the blank
     // line): a POST whose binary body starts inside the first segment must
@@ -71,6 +79,14 @@ pub fn parse_request(payload: &[u8]) -> Option<HttpRequest> {
         // reach a terminal or a report cell.
         path: crate::app::sanitize_name(path),
         host,
+    })
+}
+
+/// Does the payload begin with `METHOD SP` for one of the known methods?
+fn starts_with_method(payload: &[u8]) -> bool {
+    METHODS.iter().any(|method| {
+        payload.get(..method.len()) == Some(method.as_bytes())
+            && payload.get(method.len()) == Some(&b' ')
     })
 }
 
@@ -137,5 +153,20 @@ mod tests {
         assert!(parse_request(&[0x16, 0x03, 0x01, 0x02, 0x00]).is_none());
         // response, not request
         assert!(parse_request(b"HTTP/1.1 200 OK\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn method_prefix_gate_changes_no_verdict() {
+        // Bulk printable payload with a header terminator deep inside: the
+        // old path paid the full window scan + UTF-8 pass to say None; the
+        // method gate must say None too.
+        let mut bulk = vec![b'A'; 2048];
+        bulk.extend_from_slice(b"\r\n\r\n");
+        assert!(parse_request(&bulk).is_none());
+        // A method name not followed by a space is not a request line.
+        assert!(parse_request(b"GETX / HTTP/1.1\r\n\r\n").is_none());
+        assert!(parse_request(b"GET\r\nHost: x\r\n\r\n").is_none());
+        // Passing the gate is not enough — the full parse still rules.
+        assert!(parse_request(b"GET only-a-path-no-version\r\n\r\n").is_none());
     }
 }

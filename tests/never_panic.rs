@@ -83,7 +83,10 @@ proptest! {
     ) {
         let _ = pincer::app::dns::parse(&payload, false);
         let _ = pincer::app::dns::parse(&payload, true);
+        let _ = pincer::app::dns::parse_shallow(&payload, false);
+        let _ = pincer::app::dns::parse_shallow(&payload, true);
         let _ = pincer::app::dhcp::parse(&payload);
+        let _ = pincer::app::dhcp::parse_shallow(&payload);
         let _ = pincer::app::http::parse_request(&payload);
         let _ = pincer::app::tls::parse_client_hello(&payload);
     }

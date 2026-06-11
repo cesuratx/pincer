@@ -6,6 +6,7 @@
 //! show why we believe each fact — the discipline of attributing every
 //! inference, which is what makes passive findings trustworthy.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -160,7 +161,7 @@ impl Asset {
             }
         }
         for (name, source) in other.hostnames {
-            if self.add_hostname(name, source, cap_hostnames) {
+            if self.add_hostname(&name, source, cap_hostnames) {
                 dropped_names = dropped_names.saturating_add(1);
             }
         }
@@ -200,12 +201,14 @@ impl Asset {
     }
 
     /// Returns `true` if the name was *dropped* at the per-asset cap (so the
-    /// inventory can count it) — degradation is never silent.
-    fn add_hostname(&mut self, name: String, source: NameSource, cap: usize) -> bool {
+    /// inventory can count it) — degradation is never silent. Borrowed `name`:
+    /// the steady state (the same mDNS name re-announced every packet) is a
+    /// pure map probe; the String is allocated only on the insert path.
+    fn add_hostname(&mut self, name: &str, source: NameSource, cap: usize) -> bool {
         if name.is_empty() {
             return false;
         }
-        if let Some(existing) = self.hostnames.get_mut(&name) {
+        if let Some(existing) = self.hostnames.get_mut(name) {
             if source < *existing {
                 *existing = source;
             }
@@ -215,7 +218,7 @@ impl Asset {
         if self.hostnames.len() >= cap {
             return true;
         }
-        self.hostnames.insert(name, source);
+        self.hostnames.insert(name.to_owned(), source);
         false
     }
 
@@ -484,31 +487,37 @@ impl AssetInventory {
         if !is_unicast(ip) {
             return;
         }
-        // Rebinding a known IP (ARP refresh, or a spoofer reclaiming it) is
-        // free; only a brand-new IP counts against the cap. An ARP-spoof storm
-        // claiming millions of fresh IPs therefore stops growing the map.
-        let known = self.ip_to_mac.get(&ip).copied();
-        if known.is_none() && self.ip_to_mac.len() >= self.limits.max_bindings {
-            self.overflow.bindings = self.overflow.bindings.saturating_add(1);
-            return;
+        // One map descent via Entry (the FlowTable pattern). Rebinding a known
+        // IP (ARP refresh, or a spoofer reclaiming it) is free; only a
+        // brand-new IP counts against the cap. An ARP-spoof storm claiming
+        // millions of fresh IPs therefore stops growing the map.
+        let len = self.ip_to_mac.len();
+        match self.ip_to_mac.entry(ip) {
+            Entry::Occupied(mut entry) => {
+                if *entry.get() == mac {
+                    return; // unchanged refresh — the per-packet steady state
+                }
+                // An IP moving to a *different* MAC mid-capture (DHCP churn,
+                // VRRP failover, or spoofing) means flow attribution for that
+                // IP — which resolves through the final binding — is
+                // ambiguous. Count it so the degradation report can say so
+                // instead of silently misattributing.
+                self.overflow.rebound_ips = self.overflow.rebound_ips.saturating_add(1);
+                entry.insert(mac);
+            }
+            Entry::Vacant(entry) => {
+                if len >= self.limits.max_bindings {
+                    self.overflow.bindings = self.overflow.bindings.saturating_add(1);
+                    return;
+                }
+                entry.insert(mac);
+            }
         }
-        // An IP moving to a *different* MAC mid-capture (DHCP churn, VRRP
-        // failover, or spoofing) means flow attribution for that IP — which
-        // resolves through the final binding — is ambiguous. Count it so the
-        // degradation report can say so instead of silently misattributing.
-        if let Some(prev) = known
-            && prev != mac
-        {
-            self.overflow.rebound_ips = self.overflow.rebound_ips.saturating_add(1);
-        }
-        self.ip_to_mac.insert(ip, mac);
-        // First time this IP is bound to a MAC, fold any record we built while
-        // it was only known by IP into the MAC-keyed asset. Without this, a
+        // First binding (or a MAC change): fold any record we built while the
+        // host was only known by IP into the MAC-keyed asset. Without this, a
         // host named (DNS/mDNS) before its ARP/DHCP binding splits into two
         // assets and the inventory becomes order-dependent.
-        if known != Some(mac) {
-            self.promote_ip_asset(ip, mac);
-        }
+        self.promote_ip_asset(ip, mac);
     }
 
     /// Note a candidate IP→MAC pair seen on a data frame. Unlike [`bind`],
@@ -521,17 +530,23 @@ impl AssetInventory {
         if !is_unicast(ip) {
             return;
         }
-        if !self.provisional.contains_key(&ip) && self.provisional.len() >= self.limits.max_bindings
-        {
-            // Same flood backstop as bind(); count it under bindings so the
-            // drop is reported, not silent.
-            self.overflow.bindings = self.overflow.bindings.saturating_add(1);
-            return;
+        // One descent via Entry; the flood backstop (same as bind()) lives in
+        // the Vacant arm, counted under bindings so the drop is reported, not
+        // silent.
+        let len = self.provisional.len();
+        match self.provisional.entry(ip) {
+            Entry::Occupied(mut entry) => {
+                let (_, seen) = entry.get_mut();
+                *seen = Timestamp::min_opt(*seen, ts);
+            }
+            Entry::Vacant(entry) => {
+                if len >= self.limits.max_bindings {
+                    self.overflow.bindings = self.overflow.bindings.saturating_add(1);
+                    return;
+                }
+                entry.insert((mac, ts));
+            }
         }
-        self.provisional
-            .entry(ip)
-            .and_modify(|(_, seen)| *seen = Timestamp::min_opt(*seen, ts))
-            .or_insert((mac, ts));
     }
 
     /// Merge an `Ip(ip)`-keyed asset into the `Mac(mac)`-keyed asset, then drop
@@ -607,17 +622,21 @@ impl AssetInventory {
 
     /// Get or create an asset. Returns `None` when the inventory is at
     /// `max_assets` and this is a new identity — a random-source-IP flood then
-    /// stops creating assets (counted) instead of exhausting memory.
+    /// stops creating assets (counted) instead of exhausting memory. One map
+    /// descent via Entry (the `FlowTable` pattern), with the cap enforced in
+    /// the Vacant arm.
     fn asset_mut(&mut self, key: AssetKey, ts: Option<Timestamp>) -> Option<&mut Asset> {
-        if !self.assets.contains_key(&key) && self.assets.len() >= self.limits.max_assets {
-            self.overflow.assets = self.overflow.assets.saturating_add(1);
-            return None;
+        let len = self.assets.len();
+        match self.assets.entry(key) {
+            Entry::Occupied(entry) => Some(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                if len >= self.limits.max_assets {
+                    self.overflow.assets = self.overflow.assets.saturating_add(1);
+                    return None;
+                }
+                Some(entry.insert(Asset::new(key, ts)))
+            }
         }
-        Some(
-            self.assets
-                .entry(key)
-                .or_insert_with(|| Asset::new(key, ts)),
-        )
     }
 
     fn record_local_host(&mut self, mac: MacAddr, ip: Option<IpAddr>, ts: Option<Timestamp>) {
@@ -687,7 +706,7 @@ impl AssetInventory {
                     }
                 }
                 self.record_local_host(dhcp.client_mac, confirmed_ip.map(IpAddr::V4), ts);
-                if let Some(host) = dhcp.hostname.clone() {
+                if let Some(host) = dhcp.hostname.as_deref() {
                     self.attribute_hostname(
                         AssetKey::Mac(dhcp.client_mac),
                         host,
@@ -696,11 +715,22 @@ impl AssetInventory {
                     );
                 }
                 if let Some(asset) = self.asset_mut(AssetKey::Mac(dhcp.client_mac), ts) {
-                    if !dhcp.param_req_list.is_empty() {
+                    // Compare before replacing: the steady state (the same
+                    // device re-DHCPing with an unchanged option 55 / vendor
+                    // class) must not re-allocate per packet; a changed value
+                    // still updates — last wins, as before.
+                    if !dhcp.param_req_list.is_empty()
+                        && !fingerprint_unchanged(
+                            asset.dhcp_fingerprint.as_deref(),
+                            &dhcp.param_req_list,
+                        )
+                    {
                         asset.dhcp_fingerprint = Some(dhcp.fingerprint());
                     }
-                    if let Some(vendor) = &dhcp.vendor_class {
-                        asset.vendor_class = Some(vendor.clone());
+                    if let Some(vendor) = dhcp.vendor_class.as_deref()
+                        && asset.vendor_class.as_deref() != Some(vendor)
+                    {
+                        asset.vendor_class = Some(vendor.to_owned());
                     }
                 }
             }
@@ -745,19 +775,19 @@ impl AssetInventory {
                     if dropped {
                         self.overflow.ips = self.overflow.ips.saturating_add(1);
                     }
-                    self.attribute_hostname(key, answer.name.clone(), source, ts);
+                    self.attribute_hostname(key, &answer.name, source, ts);
                 }
             }
             AppEvent::Tls(hello) => {
-                if let (Some(sni), Some((_, dst))) = (&hello.sni, pkt.ip_pair()) {
+                if let (Some(sni), Some((_, dst))) = (hello.sni.as_deref(), pkt.ip_pair()) {
                     let key = self.key_for_ip(dst);
-                    self.attribute_hostname(key, sni.clone(), NameSource::Tls, ts);
+                    self.attribute_hostname(key, sni, NameSource::Tls, ts);
                 }
             }
             AppEvent::Http(req) => {
-                if let (Some(host), Some((_, dst))) = (&req.host, pkt.ip_pair()) {
+                if let (Some(host), Some((_, dst))) = (req.host.as_deref(), pkt.ip_pair()) {
                     let key = self.key_for_ip(dst);
-                    self.attribute_hostname(key, host.clone(), NameSource::Http, ts);
+                    self.attribute_hostname(key, host, NameSource::Http, ts);
                 }
             }
         }
@@ -766,10 +796,11 @@ impl AssetInventory {
     /// Add a hostname to an asset and count it if the per-asset cap dropped it
     /// — so a name flood from *any* source (DNS, mDNS, DHCP, TLS, HTTP) shows
     /// in `overflow.hostnames`, never silently. One home for all four sources.
+    /// Borrowed `name`: only [`Asset::add_hostname`]'s insert path allocates.
     fn attribute_hostname(
         &mut self,
         key: AssetKey,
-        name: String,
+        name: &str,
         source: NameSource,
         ts: Option<Timestamp>,
     ) {
@@ -803,6 +834,20 @@ impl AssetInventory {
             self.overflow.services = self.overflow.services.saturating_add(1);
         }
     }
+}
+
+/// Is `stored` exactly [`crate::app::DhcpSummary::fingerprint`] of `list`,
+/// decided without building the string? `fingerprint()` output is canonical
+/// decimal (no signs, no leading zeros), so the numeric per-part comparison
+/// is exact — and the steady state (unchanged option 55) costs no allocation.
+fn fingerprint_unchanged(stored: Option<&str>, list: &[u8]) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    let mut parts = stored.split(',');
+    list.iter()
+        .all(|code| parts.next().and_then(|part| part.parse::<u8>().ok()) == Some(*code))
+        && parts.next().is_none()
 }
 
 const fn source_for(is_mdns: bool) -> NameSource {
@@ -1028,6 +1073,44 @@ mod tests {
         // The ACK's yiaddr is server-confirmed: now it binds and seeds.
         observe_dhcp(&mut inv, 5, mac, &offer);
         assert!(inv.is_local(v4(192, 168, 5, 20)), "ACK binds");
+    }
+
+    #[test]
+    fn dhcp_fingerprint_and_vendor_class_track_the_latest_packet() {
+        // Compare-before-replace must stay last-wins, not become first-wins:
+        // an unchanged repeat is a no-op, a changed option 55 list / vendor
+        // class still updates the asset.
+        let mut inv = AssetInventory::new();
+        let mac = MacAddr([0x3C, 0, 0, 0, 0, 7]);
+        let first = crate::fixtures::DhcpOptions {
+            vendor_class: Some("MSFT 5.0"),
+            param_req_list: &[1, 3, 6],
+            ..crate::fixtures::DhcpOptions::default()
+        };
+        observe_dhcp(&mut inv, 1, mac, &first);
+        observe_dhcp(&mut inv, 1, mac, &first); // unchanged repeat
+        let second = crate::fixtures::DhcpOptions {
+            vendor_class: Some("android-dhcp-13"),
+            param_req_list: &[1, 121, 3],
+            ..crate::fixtures::DhcpOptions::default()
+        };
+        observe_dhcp(&mut inv, 1, mac, &second);
+        let assets = inv.assets();
+        let asset = assets
+            .iter()
+            .find(|a| a.key == AssetKey::Mac(mac))
+            .unwrap_or_else(|| unreachable!("dhcp client must be inventoried"));
+        assert_eq!(asset.dhcp_fingerprint.as_deref(), Some("1,121,3"));
+        assert_eq!(asset.vendor_class.as_deref(), Some("android-dhcp-13"));
+    }
+
+    #[test]
+    fn fingerprint_comparison_is_exact() {
+        assert!(fingerprint_unchanged(Some("1,3,6"), &[1, 3, 6]));
+        assert!(!fingerprint_unchanged(Some("1,3,6"), &[1, 3]));
+        assert!(!fingerprint_unchanged(Some("1,3"), &[1, 3, 6]));
+        assert!(!fingerprint_unchanged(Some("1,3,6"), &[1, 3, 7]));
+        assert!(!fingerprint_unchanged(None, &[1]));
     }
 
     #[test]

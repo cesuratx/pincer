@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::analysis::{AssetInventory, FlowTable, Limits, Observe, Stats, dependency_edges};
-use crate::app::sniff;
+use crate::app::{SniffDepth, sniff_with};
 use crate::decode::decode_packet;
 use crate::error::{Error, PcapError};
 use crate::output::{Degradation, DhcpRecord, DnsRecord, Report, deps_dot};
@@ -205,6 +205,16 @@ impl Pass {
             ..Self::default()
         };
 
+        // Sniffing itself is unconditional — every subcommand consumes app
+        // events (stats/flows label with them; assets/dns/dhcp are built from
+        // them) — but the *depth* is not: label-only consumers get the
+        // validation-only DNS/DHCP mode, which accepts and rejects the exact
+        // same payloads while skipping the per-record allocations.
+        let depth = SniffDepth {
+            dns_detail: needs.assets || needs.dns,
+            dhcp_detail: needs.assets || needs.dhcp,
+        };
+
         loop {
             let record = match reader.next_record() {
                 Ok(Some(record)) => record,
@@ -244,10 +254,7 @@ impl Pass {
                 }
                 continue;
             };
-            // Every subcommand consumes app events (stats/flows/assets label
-            // with them; dns/dhcp are built from them), so sniffing is
-            // unconditional — a "skip when unused" branch here was dead code.
-            let app = sniff(&pkt);
+            let app = sniff_with(&pkt, depth);
             let app_ref = app.as_ref();
 
             if needs.stats {
