@@ -16,7 +16,8 @@ pub mod types;
 
 pub use error::{DecodeError, Error, PcapError};
 
-/// CLI entry point.
-pub fn run() -> Result<(), Error> {
+/// CLI entry point. `Ok` carries the exit status: success, or
+/// [`cli::EXIT_DEGRADED`] when `--strict` is set and the analysis degraded.
+pub fn run() -> Result<std::process::ExitCode, Error> {
     cli::run()
 }

@@ -106,7 +106,7 @@ src/
 │   └── stats.rs      Capture-wide counters + anomalies
 │
 ├── output/           Rendering — strategy over one Report type
-│   ├── mod.rs        Report enum → to_table() / to_json()
+│   ├── mod.rs        Report enum → to_table() / write_json()
 │   └── table.rs      Aligned-table renderer (no crate)
 │
 ├── fixtures/         Test data — typestate packet builder
@@ -278,8 +278,34 @@ detail (`assets`, `dns`, `dhcp`) keep the full parse.
 we don't want a rendering `if/else` smeared through the analysis code.
 
 **Solution:** one [`Report`](src/output/mod.rs) enum wraps any analysis result;
-`to_table()` / `to_json()` are the interchangeable strategies. The CLI picks one
-based on `--json`. Analysis code knows nothing about formatting.
+`to_table()` / `write_json()` are the interchangeable strategies. The CLI picks
+one based on `--json`. Analysis code knows nothing about formatting.
+
+**Output integrity (every format carries its own status in-band):**
+
+- **JSON streams.** `write_json` serializes the envelope straight into the
+  stdout writer (`serde_json::to_writer_pretty`) — no intermediate
+  `serde_json::Value` tree, no second full `String`. Peak memory is the
+  analysis state plus a serializer buffer; the materializing renderer
+  measured 1.8 GB RSS from a 29 MB cap-stressing capture. The envelope's
+  byte order is fixed — `degradation` before `data` — so a truncated
+  document's salvaged prefix can never contain data without its degradation
+  record (schema v5). Tables and DOT still materialize their string first;
+  bounded by `analysis::Limits`, but cap-saturating hostile input can push
+  that to hundreds of MB — lower the caps before raising them.
+- **Tables end with a footer**: `# pincer: <n> row(s), complete` (or
+  `PARTIAL — <reasons>`, naming the nonzero degradation fields). The footer
+  is the in-band completion marker — an interrupted or pipe-truncated table
+  is otherwise byte-for-byte indistinguishable from a complete smaller one.
+  Only `--json` output is self-validating against truncation (invalid JSON);
+  a machine-ingested table must check for the footer or the wait status.
+- **DOT gets a comment header** (`// pincer: PARTIAL — <reasons>`) when the
+  analysis degraded; a saved or piped graph must not need stderr to say the
+  map is incomplete. The closing `}` is its completion marker.
+- **Exit codes**: 0 success — including degraded runs, so existing pipelines
+  keep working — 1 error, 2 usage. `--strict` (global flag) turns any
+  nonzero degradation into exit 3 (`cli::EXIT_DEGRADED`) for pipelines that
+  must branch on partial results; the report is still emitted in full.
 
 ---
 

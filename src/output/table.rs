@@ -41,6 +41,12 @@ impl Table {
         self.rows.is_empty()
     }
 
+    /// Number of data rows (headers and rule excluded).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
     /// Render to a string with two-space column gutters.
     #[must_use]
     pub fn render(&self) -> String {
