@@ -201,6 +201,46 @@ fn local_host_flood() -> Frames {
     frames
 }
 
+/// One local IP whose data frames carry two different source MACs (DHCP
+/// lease churn mid-capture, or spoofing), on a /16 taught by a DHCP ACK that
+/// can land anywhere in the shuffle. The winning identity (the smaller MAC)
+/// and the counted rebind ambiguity must not depend on arrival order — the
+/// contest is resolved per IP at finalize, so even the counter is exact.
+fn mac_conflict_churn() -> Frames {
+    let server_mac = MacAddr([2, 0, 0, 0, 0, 1]);
+    let client_mac = MacAddr([2, 0, 0, 0, 0, 0xC8]);
+    let router_mac = MacAddr([2, 0, 0, 0, 0, 0xFE]);
+    let mut frames = Frames::new();
+    let opts = fixtures::DhcpOptions {
+        your_ip: Some(Ipv4Addr::new(10, 0, 0, 200)),
+        subnet_mask: Some(Ipv4Addr::new(255, 255, 0, 0)),
+        ..fixtures::DhcpOptions::default()
+    };
+    frames.push((
+        ts(100),
+        Packet::ethernet(server_mac, MacAddr::BROADCAST)
+            .ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::BROADCAST)
+            .udp(67, 68)
+            .payload(&fixtures::dhcp(5, client_mac, 0x42, &opts)),
+    ));
+    for (i, mac) in [
+        MacAddr([2, 0, 0, 0, 0xAA, 1]),
+        MacAddr([2, 0, 0, 0, 0xBB, 2]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        frames.push((
+            ts(200 + i as u64),
+            Packet::ethernet(mac, router_mac)
+                .ipv4(Ipv4Addr::new(10, 0, 5, 5), Ipv4Addr::new(8, 8, 8, 8))
+                .udp(40000, 40001)
+                .payload(b"x"),
+        ));
+    }
+    frames
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
@@ -213,6 +253,7 @@ proptest! {
             Just(asset_flood()).prop_shuffle(),
             Just(arp_storm()).prop_shuffle(),
             Just(local_host_flood()).prop_shuffle(),
+            Just(mac_conflict_churn()).prop_shuffle(),
         ]
     ) {
         let mut canonical = shuffled.clone();
@@ -268,6 +309,30 @@ fn flow_cap_keeps_the_smallest_keys_with_exact_drop_accounting() {
         );
         assert_eq!(flows.dropped(), 24, "12 dropped flows x 2 packets each");
         assert_eq!(flows.len(), 8);
+    }
+}
+
+/// One IP under two MACs on data frames: in either arrival order the host
+/// must key to the SAME MAC (the smaller — first-writer-wins flipped the
+/// inventory, bindings, and every dependency edge with packet order) and the
+/// conflict must surface in `rebound_ips`, never as an all-zero envelope.
+#[test]
+fn conflicting_mac_claims_key_order_independently_and_are_counted() {
+    let frames = mac_conflict_churn();
+    let mut reversed = frames.clone();
+    reversed.reverse();
+    for order in [&frames, &reversed] {
+        let (_, assets) = run_sinks(order);
+        assert_eq!(
+            assets.key_for_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 5, 5))),
+            AssetKey::Mac(MacAddr([2, 0, 0, 0, 0xAA, 1])),
+            "the smaller MAC wins in any arrival order"
+        );
+        assert_eq!(
+            assets.overflow().rebound_ips,
+            1,
+            "the contested claim must be counted, not silent"
+        );
     }
 }
 

@@ -213,7 +213,9 @@ how we learned it** (its evidence):
 - hostname from DHCP, mDNS, or DNS answers
 - the **DHCP fingerprint** (option 55) — the ordered list of settings a device
   asks for, which is remarkably specific to its OS, the classic DHCP-fingerprinting trick
-- vendor from the MAC OUI
+- vendor class from DHCP option 60 (e.g. `MSFT 5.0`, `android-dhcp-14`) —
+  `pincer` does not resolve MAC OUIs itself; a downstream consumer can derive
+  the vendor from the reported MAC
 - services it offers
 
 Attribution — _why_ we believe each fact — is the discipline that separates real
@@ -224,10 +226,12 @@ passive discovery from guessing.
 A device is a **server** for a service if it's _listening_ on a port. The
 strongest passive proof is a **SYN-ACK**: when a client SYNs and the server
 answers SYN-ACK, that handshake proves the port is open and serving. Weaker
-evidence: we saw an application banner (a TLS hostname, an HTTP request). Weakest:
-we only saw traffic _to_ that port and are guessing from the port number.
-`pincer` records services with exactly these three evidence levels so you never
-overstate confidence.
+evidence: we saw an application banner (a TLS hostname, an HTTP request). UDP
+has no handshake, so its analogue is weaker still: a datagram _from_ a service
+port answering an ephemeral port — a listener responded. Weakest: we only saw
+traffic _to_ that port and are guessing from the port number. `pincer` records
+services with exactly these four evidence levels so you never overstate
+confidence.
 
 ### Dependencies — "the map"
 

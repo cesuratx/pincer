@@ -112,10 +112,17 @@ Pass `-` as the capture argument to stream from stdin — no local disk needed:
 Memory stays constant either way.
 
 Analysis collections are hard-capped (`analysis::Limits`) so a hostile capture
-degrades instead of exhausting memory. Caps evict deterministically — at a cap
-a new key is admitted only by evicting the largest admitted one, so the
-survivors are the N smallest keys of the capture and the same packets produce
-the same report in any arrival order, even cap-saturated. Anything that
+degrades instead of exhausting memory. The keyed collections (flows, assets,
+bindings, candidate sightings, subnets, and the per-asset
+hostname/service/IP sets) evict deterministically — at a cap a new key is
+admitted only by evicting the largest admitted one, so survivors are the N
+smallest keys of the capture in any arrival order. The `dns`/`dhcp` detail
+logs are chronological instead: at their cap the first N records are kept
+and the rest counted as dropped. Once any cap engages, the overflow-counter
+values tally capped events and may vary with packet order (`flows_dropped`
+is exact; zero vs nonzero is always stable), so byte-diffing capped reports
+should exclude or normalize those counters — see DESIGN.md for the
+residuals. Anything that
 degrades a run — a truncated tail, a corrupt mid-stream section header
 (concatenated pcapng), malformed blocks skipped, caps hit, records without
 timestamps (pcapng Simple Packet Blocks) — is reported as warnings on stderr

@@ -308,9 +308,11 @@ pub struct AssetOverflow {
     pub services: u64,
     /// IPs dropped at the per-asset `max_ips_per_asset` cap.
     pub ips: u64,
-    /// IPs whose MAC binding changed mid-capture (DHCP churn, VRRP failover,
-    /// spoofing) — flow attribution for these resolves through the *final*
-    /// binding and is therefore ambiguous.
+    /// IPs whose MAC claim was ambiguous: an authoritative binding changed
+    /// mid-capture (DHCP churn, VRRP failover, spoofing — counted per
+    /// event), or a local IP's data frames carried conflicting source MACs
+    /// (counted once per IP at finalize). Attribution for these resolves
+    /// through one deterministic winner and is therefore ambiguous.
     pub rebound_ips: u64,
 }
 
@@ -361,14 +363,14 @@ pub struct AssetInventory {
     /// a tiny handful — instead of `O(total_subnets)` per packet.
     local_v4_subnets: BTreeMap<u32, BTreeSet<u32>>,
     subnet_count: usize,
-    /// Candidate `IP → (MAC, first ts, last ts)` sightings from data frames,
-    /// to be confirmed against the *final* subnet knowledge in
-    /// [`AssetInventory::finalize`]. Data frames make no mid-stream binding
-    /// or inventory claim at all — deciding per-packet made membership and
-    /// keying depend on whether a host's frames preceded the ARP/DHCP that
-    /// taught its segment. The sighting window (first/last) carries the
-    /// host's honest seen times to the deferred record.
-    provisional: BTreeMap<IpAddr, (MacAddr, Option<Timestamp>, Option<Timestamp>)>,
+    /// Candidate `IP → MAC` sightings from data frames, to be confirmed
+    /// against the *final* subnet knowledge in [`AssetInventory::finalize`].
+    /// Data frames make no mid-stream binding or inventory claim at all —
+    /// deciding per-packet made membership and keying depend on whether a
+    /// host's frames preceded the ARP/DHCP that taught its segment. The
+    /// sighting window (first/last) carries the host's honest seen times to
+    /// the deferred record.
+    provisional: BTreeMap<IpAddr, Sighting>,
     finalized: bool,
     limits: Limits,
     overflow: AssetOverflow,
@@ -378,6 +380,18 @@ impl Default for AssetInventory {
     fn default() -> Self {
         Self::with_limits(Limits::default())
     }
+}
+
+/// One data-frame candidate: the claiming MAC (the numerically smallest one
+/// when claims conflict — the same smallest-key convention every cap uses, so
+/// the winner is a function of the packet set, not arrival order), the
+/// sighting window, and whether more than one MAC claimed the IP.
+#[derive(Debug, Clone, Copy)]
+struct Sighting {
+    mac: MacAddr,
+    first: Option<Timestamp>,
+    last: Option<Timestamp>,
+    contested: bool,
 }
 
 /// Mask assumed for a segment learned from ARP, which carries no netmask.
@@ -431,20 +445,28 @@ impl AssetInventory {
         self.finalized = true;
         // Snapshot to satisfy the borrow checker; provisional is bounded by
         // max_bindings, so this is a small, one-time pass.
-        let pending: Vec<(IpAddr, MacAddr, Option<Timestamp>, Option<Timestamp>)> = self
+        let pending: Vec<(IpAddr, Sighting)> = self
             .provisional
             .iter()
             .filter(|(ip, _)| self.is_local(**ip))
-            .map(|(ip, (mac, first, last))| (*ip, *mac, *first, *last))
+            .map(|(ip, sighting)| (*ip, *sighting))
             .collect();
-        for (ip, mac, first, last) in pending {
+        for (ip, sighting) in pending {
+            // A contested local candidate is the same ambiguity as a
+            // mid-capture rebind — which MAC the host's evidence keys to
+            // depends on which claim was true — so it is counted, never
+            // resolved silently. Off-link IPs never reach here: many gateway
+            // MACs legitimately front one remote IP.
+            if sighting.contested {
+                self.overflow.rebound_ips = self.overflow.rebound_ips.saturating_add(1);
+            }
             // An already-authoritative binding is a free refresh; a conflict
             // is the counted rebind ambiguity, same as a late ARP would be.
-            self.bind(mac, ip);
+            self.bind(sighting.mac, ip);
             // Record the host with the window its data frames actually
             // spanned — two folds: min via `first`, max via `last`.
-            self.record_local_host(mac, Some(ip), first);
-            self.record_local_host(mac, None, last);
+            self.record_local_host(sighting.mac, Some(ip), sighting.first);
+            self.record_local_host(sighting.mac, None, sighting.last);
         }
     }
 
@@ -604,6 +626,10 @@ impl AssetInventory {
     /// smallest-N eviction (and the same comparator) as [`bind`], so the
     /// candidates finalize sees — and therefore the bindings it confirms —
     /// are order-independent; drops are counted under bindings, not silent.
+    /// Conflicting MAC claims for one IP keep the smallest MAC and mark the
+    /// entry contested, so finalize can count the ambiguity if the IP is
+    /// local (first-writer-wins would make the identity order-dependent AND
+    /// invisible).
     fn record_provisional(&mut self, mac: MacAddr, ip: IpAddr, ts: Option<Timestamp>) {
         if mac == MacAddr::BROADCAST || mac.is_multicast() || mac == MacAddr::ZERO {
             return;
@@ -625,12 +651,21 @@ impl AssetInventory {
         }
         match self.provisional.entry(ip) {
             Entry::Occupied(mut entry) => {
-                let (_, first, last) = entry.get_mut();
-                *first = Timestamp::min_opt(*first, ts);
-                *last = (*last).max(ts);
+                let sighting = entry.get_mut();
+                if sighting.mac != mac {
+                    sighting.contested = true;
+                    sighting.mac = sighting.mac.min(mac);
+                }
+                sighting.first = Timestamp::min_opt(sighting.first, ts);
+                sighting.last = sighting.last.max(ts);
             }
             Entry::Vacant(entry) => {
-                entry.insert((mac, ts, ts));
+                entry.insert(Sighting {
+                    mac,
+                    first: ts,
+                    last: ts,
+                    contested: false,
+                });
             }
         }
     }
@@ -1284,6 +1319,50 @@ mod tests {
         // Same IP claimed by a different MAC: churn/failover/spoof — counted.
         inv.bind_authoritative(MacAddr([2, 0, 0, 0, 0, 2]), IpAddr::V4(ip));
         assert_eq!(inv.overflow().rebound_ips, 1);
+    }
+
+    #[test]
+    fn contested_provisional_claim_keys_the_smaller_mac_and_is_counted() {
+        // One local IP sighted on data frames under two MACs (lease churn,
+        // spoofing): in either arrival order the host must key to the same
+        // MAC — the smaller one — and the ambiguity must reach rebound_ips,
+        // never first-writer-wins with an all-zero degradation envelope.
+        let (m1, m2) = (
+            MacAddr([2, 0, 0, 0, 0xAA, 1]),
+            MacAddr([2, 0, 0, 0, 0xBB, 2]),
+        );
+        let ip = v4(10, 0, 5, 5);
+        for (first, second) in [(m1, m2), (m2, m1)] {
+            let mut inv = AssetInventory::new();
+            inv.learn_subnet(Ipv4Addr::new(10, 0, 0, 1), 0xFFFF_0000); // 10.0.0.0/16
+            inv.record_provisional(first, ip, Some(Timestamp::new(1, 0)));
+            inv.record_provisional(second, ip, Some(Timestamp::new(2, 0)));
+            inv.finalize();
+            assert_eq!(
+                inv.key_for_ip(ip),
+                AssetKey::Mac(m1),
+                "the smaller MAC must win in any arrival order"
+            );
+            assert_eq!(
+                inv.overflow().rebound_ips,
+                1,
+                "the conflicting claim must be counted"
+            );
+        }
+    }
+
+    #[test]
+    fn contested_off_link_sightings_are_not_rebinds() {
+        // Two gateway MACs fronting one remote IP is normal multi-router
+        // traffic, not an identity ambiguity: the IP never binds, so the
+        // contest must not raise a degradation signal.
+        let mut inv = AssetInventory::new();
+        let ip = v4(8, 8, 8, 8);
+        inv.record_provisional(MacAddr([2, 0, 0, 0, 0, 1]), ip, Some(Timestamp::ZERO));
+        inv.record_provisional(MacAddr([2, 0, 0, 0, 0, 2]), ip, Some(Timestamp::ZERO));
+        inv.finalize();
+        assert_eq!(inv.overflow().rebound_ips, 0);
+        assert_eq!(inv.key_for_ip(ip), AssetKey::Ip(ip), "stays IP-keyed");
     }
 
     /// Decode + sniff + observe an arbitrary fixture frame — the same path

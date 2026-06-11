@@ -11,7 +11,8 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
+use etherparse::{ArpOperation, NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
+use pincer::decode::arp::ArpOp;
 use pincer::decode::{NetView, TransportView, decode_packet};
 use pincer::fixtures::{Packet, dns_query, http_get, tls_client_hello};
 use pincer::pcap::{LinkType, Record};
@@ -217,6 +218,58 @@ fn ipv6_hop_by_hop_before_tcp_agrees() {
             );
         }
         (ours, theirs) => panic!("transport layer disagreement: {ours:?} vs {theirs:?}"),
+    }
+}
+
+/// ARP request and reply: this layout feeds the MAC↔IP bindings and the /24
+/// subnet guess in the asset inventory, so a misread of any field is an
+/// inventory-poisoning bug — every field is cross-checked against
+/// etherparse's independent ARP parser.
+#[test]
+fn arp_request_and_reply_agree() {
+    let sender_ip = Ipv4Addr::new(192, 168, 1, 9);
+    let target_ip = Ipv4Addr::new(192, 168, 1, 1);
+    let request = Packet::ethernet(laptop(), MacAddr([0xFF; 6])).arp_request(sender_ip, target_ip);
+    let reply = Packet::ethernet(server(), laptop()).arp_reply(target_ip, laptop(), sender_ip);
+    for (frame, op) in [
+        (&request, ArpOperation::REQUEST),
+        (&reply, ArpOperation::REPLY),
+    ] {
+        let ours = decode_packet(&record(frame)).unwrap();
+        let theirs = SlicedPacket::from_ethernet(frame).unwrap();
+        let NetView::Arp(our_arp) = &ours.net else {
+            panic!("pincer did not decode ARP")
+        };
+        let Some(NetSlice::Arp(their_arp)) = &theirs.net else {
+            panic!("etherparse did not decode ARP")
+        };
+        assert_eq!(their_arp.operation(), op);
+        let our_op = match our_arp.op {
+            ArpOp::Request => ArpOperation::REQUEST,
+            ArpOp::Reply => ArpOperation::REPLY,
+            ArpOp::Other(other) => ArpOperation(other),
+        };
+        assert_eq!(our_op, op, "operation mismatch");
+        assert_eq!(
+            our_arp.sender_mac.0.as_slice(),
+            their_arp.sender_hw_addr(),
+            "sender MAC mismatch"
+        );
+        assert_eq!(
+            our_arp.sender_ip.octets().as_slice(),
+            their_arp.sender_protocol_addr(),
+            "sender IP mismatch"
+        );
+        assert_eq!(
+            our_arp.target_mac.0.as_slice(),
+            their_arp.target_hw_addr(),
+            "target MAC mismatch"
+        );
+        assert_eq!(
+            our_arp.target_ip.octets().as_slice(),
+            their_arp.target_protocol_addr(),
+            "target IP mismatch"
+        );
     }
 }
 
