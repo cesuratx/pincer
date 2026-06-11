@@ -15,6 +15,7 @@ cargo clippy --all-targets -- -D warnings     # lint gate (must be clean)
 cargo fmt                                      # format
 cargo run -- gen testdata                     # (re)generate sample captures
 cargo run -- summary testdata/office.pcap     # try a subcommand
+cargo +nightly fuzz run fuzz_pipeline         # coverage-guided fuzzing (fuzz/ is its own crate; see README § Fuzzing)
 ```
 
 Subcommands: `summary`, `flows`, `assets`, `services`, `deps` (`--dot` for

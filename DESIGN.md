@@ -447,7 +447,7 @@ same tail the shipped binary runs.
 
 ## 8. Testing strategy (how we trust it)
 
-Four layers, each catching a different failure class:
+Five layers, each catching a different failure class:
 
 1. **Hex-fixture unit tests** ([tests/decode_layers.rs](tests/decode_layers.rs))
    — hand-assembled packets with byte-offset comments; the test you read to
@@ -464,6 +464,12 @@ Four layers, each catching a different failure class:
    payload boundary. Catches "I misread the spec."
 4. **Property tests** ([tests/never_panic.rs](tests/never_panic.rs)) — the
    never-panic proof, via fuzzing.
+5. **Coverage-guided fuzzing** ([fuzz/](fuzz/)) — five cargo-fuzz/libFuzzer
+   targets (full pipeline, each container format behind a valid header
+   prefix, the DNS parser, the link-type decode fan-out), run ad hoc on
+   nightly (see README § Fuzzing). Coverage feedback penetrates the
+   magic/length gates that blind random generation in layer 4 statistically
+   cannot.
 
 Plus a **round-trip guarantee**: the committed sample captures are byte-identical
 to what the fixture builder generates (a test enforces it), so the samples can

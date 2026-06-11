@@ -76,7 +76,8 @@ fn drain_pipeline(bytes: &[u8]) {
 /// Every real capture, mutated at structural offsets (truncations + byte
 /// flips), must drive the full pipeline without panicking — the never-panic
 /// guarantee proven on bytes we did not craft. Deterministic (no RNG) so a
-/// failure is reproducible. Complements the binary-level fuzz that runs ad hoc.
+/// failure is reproducible. Complements the coverage-guided cargo-fuzz
+/// targets in `fuzz/`, which run ad hoc on nightly.
 #[test]
 fn real_captures_survive_mutation() {
     for path in real_captures() {

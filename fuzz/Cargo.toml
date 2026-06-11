@@ -1,0 +1,59 @@
+[package]
+name = "pincer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.pincer]
+path = ".."
+
+# Crash artifacts must symbolicate; cargo-fuzz builds release.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_pipeline"
+path = "fuzz_targets/fuzz_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pcapng"
+path = "fuzz_targets/fuzz_pcapng.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_legacy"
+path = "fuzz_targets/fuzz_legacy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dns"
+path = "fuzz_targets/fuzz_dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_decode"
+path = "fuzz_targets/fuzz_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Own workspace root, so the parent package never builds this crate: the
+# root `cargo fmt/clippy/test` gates stay stable-toolchain-only, and only
+# `cargo +nightly fuzz` ever compiles the libFuzzer runtime.
+[workspace]
+members = ["."]
