@@ -429,8 +429,20 @@ impl Pass {
     }
 }
 
+/// Test hook, not CLI contract: `PINCER_TINY_LIMITS=1` swaps in
+/// [`Limits::tiny`] so the binary-level tests can engage every hostile-flood
+/// cap (and its stderr/envelope reporting) with a few-packet capture instead
+/// of a multi-million-record flood.
+fn effective_limits() -> Limits {
+    if std::env::var_os("PINCER_TINY_LIMITS").is_some() {
+        Limits::tiny()
+    } else {
+        Limits::default()
+    }
+}
+
 fn run_analysis(common: &Common, which: Which, strict: bool) -> Result<ExitCode, Error> {
-    let pass = Pass::run(&common.file, which.needs(), Limits::default())?;
+    let pass = Pass::run(&common.file, which.needs(), effective_limits())?;
     let assets = pass.assets.assets();
     let report = match which {
         Which::Summary => Report::Summary(&pass.stats),
@@ -452,7 +464,7 @@ fn run_deps(args: &DepsArgs, strict: bool) -> Result<ExitCode, Error> {
         assets: true,
         ..Needs::default()
     };
-    let pass = Pass::run(&args.common.file, needs, Limits::default())?;
+    let pass = Pass::run(&args.common.file, needs, effective_limits())?;
     let edges = dependency_edges(&pass.flows, &pass.assets);
     let degradation = pass.degradation();
     if args.dot && !args.common.json {

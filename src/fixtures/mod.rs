@@ -31,13 +31,22 @@ impl Packet {
 pub struct EthStage {
     src: MacAddr,
     dst: MacAddr,
-    vlans: Vec<u16>,
+    /// `(TPID, VID)` per tag, outermost first.
+    vlans: Vec<(u16, u16)>,
 }
 
 impl EthStage {
+    /// 802.1Q customer tag (TPID 0x8100).
     #[must_use]
-    pub fn vlan(mut self, vid: u16) -> Self {
-        self.vlans.push(vid & 0x0FFF);
+    pub fn vlan(self, vid: u16) -> Self {
+        self.vlan_tpid(0x8100, vid)
+    }
+
+    /// VLAN tag with an explicit tag protocol ID — 0x88A8 (802.1ad service
+    /// tag) or a pre-standard 0x9100/0x9200/0x9300 for `QinQ` outer tags.
+    #[must_use]
+    pub fn vlan_tpid(mut self, tpid: u16, vid: u16) -> Self {
+        self.vlans.push((tpid, vid & 0x0FFF));
         self
     }
 
@@ -45,8 +54,8 @@ impl EthStage {
         let mut out = Vec::with_capacity(14 + 4 * self.vlans.len() + payload.len());
         out.extend_from_slice(&self.dst.0);
         out.extend_from_slice(&self.src.0);
-        for vid in &self.vlans {
-            out.extend_from_slice(&0x8100u16.to_be_bytes());
+        for (tpid, vid) in &self.vlans {
+            out.extend_from_slice(&tpid.to_be_bytes());
             out.extend_from_slice(&vid.to_be_bytes());
         }
         out.extend_from_slice(&ethertype.to_be_bytes());
@@ -66,6 +75,7 @@ impl EthStage {
             dst,
             ttl: 64,
             ident: 0x4000,
+            options: Vec::new(),
         }
     }
 
@@ -76,6 +86,7 @@ impl EthStage {
             src,
             dst,
             hop_limit: 64,
+            hop_by_hop: false,
         }
     }
 
@@ -124,6 +135,7 @@ pub struct Ipv4Stage {
     dst: Ipv4Addr,
     ttl: u8,
     ident: u16,
+    options: Vec<u8>,
 }
 
 impl Ipv4Stage {
@@ -136,6 +148,18 @@ impl Ipv4Stage {
     #[must_use]
     pub fn ident(mut self, ident: u16) -> Self {
         self.ident = ident;
+        self
+    }
+
+    /// IPv4 options bytes, padded here to a 4-byte boundary (zero
+    /// End-of-Options padding) and capped at the protocol maximum of 40.
+    /// Raises the IHL above 5 — the decoder's options skip decides where the
+    /// transport header (and everything sniffed above it) begins.
+    #[must_use]
+    pub fn ip_options(mut self, options: &[u8]) -> Self {
+        let mut padded = options.get(..options.len().min(40)).unwrap_or(&[]).to_vec();
+        padded.resize(padded.len().next_multiple_of(4).min(40), 0);
+        self.options = padded;
         self
     }
 
@@ -172,9 +196,12 @@ impl Ipv4Stage {
     }
 
     fn build(self, proto: u8, payload: &[u8]) -> Vec<u8> {
-        let total_len = len_u16(20 + payload.len());
-        let mut header = Vec::with_capacity(20);
-        header.push(0x45); // version 4, IHL 5
+        // `ip_options` pre-pads to a 4-byte multiple and caps at 40, so the
+        // header length is always expressible as an IHL of 5..=15 words.
+        let header_len = 20 + self.options.len();
+        let total_len = len_u16(header_len + payload.len());
+        let mut header = Vec::with_capacity(header_len);
+        header.push(0x40 | u8::try_from(header_len / 4).unwrap_or(5)); // version 4, IHL
         header.push(0);
         header.extend_from_slice(&total_len.to_be_bytes());
         header.extend_from_slice(&self.ident.to_be_bytes());
@@ -184,6 +211,7 @@ impl Ipv4Stage {
         header.extend_from_slice(&[0, 0]); // checksum placeholder
         header.extend_from_slice(&self.src.octets());
         header.extend_from_slice(&self.dst.octets());
+        header.extend_from_slice(&self.options);
         let checksum = internet_checksum(&[&header]);
         splice_u16(&mut header, 10, checksum);
 
@@ -209,9 +237,19 @@ pub struct Ipv6Stage {
     src: Ipv6Addr,
     dst: Ipv6Addr,
     hop_limit: u8,
+    hop_by_hop: bool,
 }
 
 impl Ipv6Stage {
+    /// Insert a minimal hop-by-hop extension header (8 octets, PadN-filled)
+    /// between the fixed header and the transport: the decoder must walk the
+    /// next-header chain instead of trusting the fixed header's value.
+    #[must_use]
+    pub fn hop_by_hop(mut self) -> Self {
+        self.hop_by_hop = true;
+        self
+    }
+
     #[must_use]
     pub fn udp(self, src_port: u16, dst_port: u16) -> UdpStage {
         UdpStage {
@@ -234,15 +272,32 @@ impl Ipv6Stage {
         }
     }
 
+    /// `ICMPv6` echo (type 128 request / 129 reply), checksummed over the v6
+    /// pseudo-header.
+    #[must_use]
+    pub fn icmpv6_echo(self, request: bool) -> Vec<u8> {
+        let mut icmp = vec![if request { 128 } else { 129 }, 0, 0, 0, 0, 1, 0, 1];
+        icmp.extend_from_slice(b"pincer-ping");
+        let pseudo = self.pseudo_header(58, len_u16(icmp.len()));
+        let checksum = internet_checksum(&[&pseudo, &icmp]);
+        splice_u16(&mut icmp, 2, checksum);
+        self.build(58, &icmp)
+    }
+
     fn build(self, next_header: u8, payload: &[u8]) -> Vec<u8> {
+        // Hop-by-hop: next-header, length 0 (= 8 octets total), PadN(4).
+        let ext_block = [next_header, 0, 1, 4, 0, 0, 0, 0];
+        let ext: &[u8] = if self.hop_by_hop { &ext_block } else { &[] };
+        let first_header = if self.hop_by_hop { 0 } else { next_header };
         let mut header = Vec::with_capacity(40);
         header.extend_from_slice(&0x6000_0000u32.to_be_bytes());
-        header.extend_from_slice(&len_u16(payload.len()).to_be_bytes());
-        header.push(next_header);
+        header.extend_from_slice(&len_u16(ext.len() + payload.len()).to_be_bytes());
+        header.push(first_header);
         header.push(self.hop_limit);
         header.extend_from_slice(&self.src.octets());
         header.extend_from_slice(&self.dst.octets());
         let mut packet = header;
+        packet.extend_from_slice(ext);
         packet.extend_from_slice(payload);
         self.eth.frame(0x86DD, &packet)
     }

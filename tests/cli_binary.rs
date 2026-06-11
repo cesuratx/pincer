@@ -9,7 +9,13 @@
     clippy::indexing_slicing
 )]
 
+mod common;
+
+use std::net::Ipv4Addr;
 use std::process::{Command, Output};
+
+use pincer::fixtures::{self, Packet};
+use pincer::types::{MacAddr, Timestamp};
 
 const OFFICE: &str = "testdata/office.pcap";
 
@@ -18,6 +24,28 @@ fn pincer(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("binary must run")
+}
+
+/// The binary under the `PINCER_TINY_LIMITS` test hook, so a few-packet
+/// capture can engage the hostile-flood caps and their reporting.
+fn pincer_tiny(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_pincer"))
+        .args(args)
+        .env("PINCER_TINY_LIMITS", "1")
+        .output()
+        .expect("binary must run")
+}
+
+/// Write fixture frames to a temp legacy pcap for the binary to read.
+fn write_capture(tag: &str, frames: &[(Timestamp, Vec<u8>)]) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("pincer-bin-{tag}-{}.pcap", std::process::id()));
+    let file = std::fs::File::create(&path).expect("temp capture");
+    fixtures::scenarios::write_pcap(frames, file).expect("write capture");
+    path
+}
+
+fn ts(i: u64) -> Timestamp {
+    Timestamp::new(1_700_000_000 + i, 0)
 }
 
 #[test]
@@ -226,6 +254,257 @@ fn dot_partial_header_appears_exactly_when_degraded() {
     );
     assert!(dot.contains("digraph dependencies {"));
     assert!(dot.trim_end().ends_with('}'), "still valid Graphviz");
+}
+
+/// The degrade-don't-discard contract end to end: a capture cut mid-record
+/// exits 0, the warning lands on stderr, the envelope flips `truncated_tail`,
+/// and stdout stays pure JSON — no warning text for a consumer to choke on.
+#[test]
+fn truncated_capture_warns_on_stderr_and_flags_the_envelope() {
+    let trunc = truncated_office("warn");
+    let out = pincer(&["summary", trunc.to_str().unwrap(), "--json"]);
+    std::fs::remove_file(&trunc).ok();
+
+    assert_eq!(out.status.code(), Some(0), "degraded is not broken");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("pincer: warning:") && stderr.contains("truncated record"),
+        "stderr must carry the truncation warning: {stderr}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("warning"),
+        "warnings must never leak into stdout: {stdout}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is pure JSON");
+    assert_eq!(
+        json.pointer("/degradation/truncated_tail"),
+        Some(&serde_json::Value::Bool(true)),
+        "the envelope must flag the truncated tail"
+    );
+}
+
+/// A well-framed pcapng whose SPB body is too short for its own `orig_len`
+/// field is per-packet damage: the reader skips it, the count reaches both
+/// stderr and the envelope, and the valid packet after it survives.
+#[test]
+fn malformed_spb_is_skipped_counted_and_warned() {
+    let mut file = common::shb_le();
+    file.extend_from_slice(&common::idb_le());
+    // SPB framing claiming total_len 12: a zero-byte body with no room for
+    // the mandatory orig_len field.
+    file.extend_from_slice(&3u32.to_le_bytes());
+    file.extend_from_slice(&12u32.to_le_bytes());
+    file.extend_from_slice(&12u32.to_le_bytes());
+    file.extend_from_slice(&common::epb_le(0, 0, &common::udp_frame(40000)));
+
+    let out = common::run_on("bad-spb", &file, &["summary", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a skipped block degrades, never breaks: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json.pointer("/degradation/skipped_blocks")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the skipped block must reach the envelope"
+    );
+    assert_eq!(
+        json.pointer("/data/packets")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the valid packet after the bad SPB must survive"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("malformed packet block"),
+        "stderr must warn about the skipped block: {stderr}"
+    );
+}
+
+/// One IP claimed by two MACs (ARP churn/spoofing) at default limits: the
+/// rebind ambiguity must reach stderr and the envelope, and count as
+/// degradation under `--strict` — a regression here silently misattributes
+/// every flow of that IP.
+#[test]
+fn ip_rebind_warns_on_stderr_and_flags_the_envelope() {
+    let ip = Ipv4Addr::new(10, 0, 0, 5);
+    let gw = Ipv4Addr::new(10, 0, 0, 1);
+    let frames = vec![
+        (
+            ts(0),
+            Packet::ethernet(MacAddr([2, 0, 0, 0, 0, 1]), MacAddr::BROADCAST).arp_request(ip, gw),
+        ),
+        (
+            ts(1),
+            Packet::ethernet(MacAddr([2, 0, 0, 0, 0, 2]), MacAddr::BROADCAST).arp_request(ip, gw),
+        ),
+    ];
+    let path = write_capture("rebind", &frames);
+    let out = pincer(&["assets", path.to_str().unwrap(), "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a rebind degrades, never breaks"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("pincer: warning:") && stderr.contains("changed MAC binding"),
+        "stderr must carry the rebind warning: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json.pointer("/degradation/ips_rebound")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the rebind must reach the envelope"
+    );
+    let strict = pincer(&["assets", path.to_str().unwrap(), "--strict"]);
+    assert_eq!(strict.status.code(), Some(3), "a rebind is degradation");
+    std::fs::remove_file(&path).ok();
+}
+
+/// A frame too short for any link layer: excluded, warned about on stderr,
+/// counted in the envelope — and the valid packet around it survives.
+#[test]
+fn undecodable_record_warns_on_stderr_and_flags_the_envelope() {
+    let frames = vec![
+        (ts(0), vec![0xDE, 0xAD, 0xBE, 0xEF]), // sub-14-byte: no Ethernet
+        (ts(1), common::udp_frame(40000)),
+    ];
+    let path = write_capture("undecodable", &frames);
+    let out = pincer(&["summary", path.to_str().unwrap(), "--json"]);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("undecodable link layer"),
+        "stderr must warn about the undecodable record: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json.pointer("/degradation/undecodable_records")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the undecodable record must reach the envelope"
+    );
+    assert_eq!(
+        json.pointer("/data/packets")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the valid packet must survive"
+    );
+}
+
+/// Flow-cap flood through the real binary (via the `PINCER_TINY_LIMITS`
+/// hook): the cap warning lands on stderr and `flows_dropped` is nonzero in
+/// the envelope.
+#[test]
+fn flow_cap_warns_on_stderr_and_flags_the_envelope() {
+    let client = MacAddr([2, 0, 0, 0, 0, 1]);
+    let server = MacAddr([2, 0, 0, 0, 0, 2]);
+    let frames: Vec<(Timestamp, Vec<u8>)> = (0..20u16)
+        .map(|i| {
+            (
+                ts(u64::from(i)),
+                Packet::ethernet(client, server)
+                    .ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2))
+                    .tcp(49100 + i, 443)
+                    .syn()
+                    .build(),
+            )
+        })
+        .collect();
+    let path = write_capture("flowcap", &frames);
+    let out = pincer_tiny(&["flows", path.to_str().unwrap(), "--json"]);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("flow table hit its cap"),
+        "stderr must warn about the flow cap: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        json.pointer("/degradation/flows_dropped")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap()
+            > 0,
+        "the flow-cap drops must reach the envelope"
+    );
+}
+
+/// Asset-cap flood (an ARP storm from 20 distinct hosts against the tiny
+/// caps): the asset-cap warning lands on stderr and `assets_dropped` is
+/// nonzero in the envelope.
+#[test]
+fn asset_cap_warns_on_stderr_and_flags_the_envelope() {
+    let frames: Vec<(Timestamp, Vec<u8>)> = (0..20u8)
+        .map(|i| {
+            let mac = MacAddr([2, 0, 0, 0, 2, i]);
+            (
+                ts(u64::from(i)),
+                Packet::ethernet(mac, MacAddr::BROADCAST)
+                    .arp_request(Ipv4Addr::new(10, 0, i, 5), Ipv4Addr::new(10, 0, i, 1)),
+            )
+        })
+        .collect();
+    let path = write_capture("assetcap", &frames);
+    let out = pincer_tiny(&["assets", path.to_str().unwrap(), "--json"]);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("asset caps reached"),
+        "stderr must warn about the asset caps: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        json.pointer("/degradation/assets_dropped")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap()
+            > 0,
+        "the asset-cap drops must reach the envelope"
+    );
+}
+
+/// Detail-record cap (12 DHCP messages against the tiny cap of 8): the cap
+/// warning lands on stderr and the exact drop count reaches the envelope.
+#[test]
+fn detail_record_cap_warns_on_stderr_and_flags_the_envelope() {
+    let frames: Vec<(Timestamp, Vec<u8>)> = (0..12u8)
+        .map(|i| {
+            let mac = MacAddr([2, 0, 0, 0, 0, i]);
+            let opts = fixtures::DhcpOptions {
+                hostname: Some("flood-host"),
+                ..fixtures::DhcpOptions::default()
+            };
+            let frame = Packet::ethernet(mac, MacAddr::BROADCAST)
+                .ipv4(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST)
+                .udp(68, 67)
+                .payload(&fixtures::dhcp(1, mac, 0x1000 + u32::from(i), &opts));
+            (ts(u64::from(i)), frame)
+        })
+        .collect();
+    let path = write_capture("dhcpcap", &frames);
+    let out = pincer_tiny(&["dhcp", path.to_str().unwrap(), "--json"]);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("detail-record caps reached"),
+        "stderr must warn about the record cap: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json.pointer("/degradation/dhcp_records_dropped")
+            .and_then(serde_json::Value::as_u64),
+        Some(4),
+        "the dropped record count must reach the envelope"
+    );
 }
 
 /// The envelope's byte order is the salvage contract: `degradation` must

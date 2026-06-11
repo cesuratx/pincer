@@ -432,6 +432,29 @@ mod tests {
         assert_eq!(summary.queries.len(), usize::from(MAX_QUESTIONS));
     }
 
+    /// The strictly-backwards rule alone cannot bound work on a message full
+    /// of chained pointers — the jump budget is the operative O(n) guarantee.
+    /// Pin its boundary: a 16-jump chain (the exact budget) parses, 17 jumps
+    /// are rejected.
+    #[test]
+    fn pointer_jump_budget_pins_the_boundary() {
+        // A literal name at offset 0, then a chain of pointers each targeting
+        // the previous one — all strictly backwards, so only the budget can
+        // stop the walk.
+        let mut msg = vec![1, b'a', 0];
+        let mut hops = vec![0u16]; // start of the literal
+        for _ in 0..17 {
+            let target = *hops.last().unwrap();
+            hops.push(u16::try_from(msg.len()).unwrap());
+            msg.extend_from_slice(&(0xC000 | target).to_be_bytes());
+        }
+        // Starting at the 16th pointer: exactly MAX_POINTER_JUMPS jumps.
+        let (name, _) = parse_name(&msg, usize::from(hops[16]), msg.len()).unwrap();
+        assert_eq!(name, "a");
+        // The 17th exceeds the budget.
+        assert!(parse_name(&msg, usize::from(hops[17]), msg.len()).is_err());
+    }
+
     #[test]
     fn rejects_pointer_loop() {
         let mut msg = sample_response();

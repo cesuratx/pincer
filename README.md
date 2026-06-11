@@ -36,7 +36,8 @@ analysis exit 3 instead of 0.
 
 `src/bytes.rs` (the cursor), `src/pcap/` (readers + writer), `src/decode/`
 (layers), `src/app/` (sniffers), `src/analysis/` (flows/assets/deps/stats),
-`src/output/` (table/JSON/DOT), `src/fixtures/` (packet builder + scenarios).
+`src/output/` (table/JSON/DOT), `src/fixtures/` (packet builder + scenarios),
+`fuzz/` (cargo-fuzz targets, a separate crate — see Fuzzing below).
 
 ## Learning the project
 
@@ -59,6 +60,51 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 Built to explore how passive network sensors turn raw traffic into asset
 intelligence — communication flows, an asset inventory, and a dependency map.
 
+### Fuzzing
+
+Coverage-guided fuzzing lives in [`fuzz/`](fuzz/) — its own crate and
+workspace, excluded from the root build (libFuzzer needs nightly; the root
+gates stay on stable):
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz
+cargo +nightly fuzz list               # the five targets
+cargo +nightly fuzz run fuzz_pipeline  # add e.g. -- -max_total_time=600
+```
+
+The targets, narrowest reach last:
+
+- `fuzz_pipeline` — raw bytes through the full shipped path: reader →
+  decode → sniff → every sink → finalize → dependency edges → JSON + DOT
+  render.
+- `fuzz_pcapng` / `fuzz_legacy` — a valid container prefix (SHB+IDB / global
+  header) followed by the fuzzed record stream, so mutation lands inside the
+  block-walking machinery instead of dying at the magic check.
+- `fuzz_dns` — straight into the DNS message parser (name decompression is
+  the loop- and amplification-prone hot spot), asserting that the deep and
+  shallow parse modes agree on accept/reject.
+- `fuzz_decode` — `decode_packet` across every supported link type, no
+  container framing in the way.
+
+Seed the corpora from the committed samples; `fuzz_legacy` takes the record
+stream *after* the 24-byte global header:
+
+```bash
+mkdir -p fuzz/corpus/{fuzz_pipeline,fuzz_decode,fuzz_legacy}
+cp testdata/*.pcap fuzz/corpus/fuzz_pipeline/
+cp testdata/*.pcap fuzz/corpus/fuzz_decode/
+for f in testdata/*.pcap; do tail -c +25 "$f" > "fuzz/corpus/fuzz_legacy/$(basename "$f")"; done
+```
+
+(`fuzz_pcapng` and `fuzz_dns` take a bare block stream / DNS message, which
+no committed fixture is, so they start from an empty corpus.) Captures
+fetched into `testdata-real/` make good extra seeds for `fuzz_pipeline`.
+
+There is deliberately no CI fuzz job — nightly toolchain churn makes one
+flaky. A scheduled job (~10 min per target, corpus cached between runs) is
+reasonable follow-up work.
+
 ## Streaming, limits, and degradation
 
 Pass `-` as the capture argument to stream from stdin — no local disk needed:
@@ -66,10 +112,17 @@ Pass `-` as the capture argument to stream from stdin — no local disk needed:
 Memory stays constant either way.
 
 Analysis collections are hard-capped (`analysis::Limits`) so a hostile capture
-degrades instead of exhausting memory. Caps evict deterministically — at a cap
-a new key is admitted only by evicting the largest admitted one, so the
-survivors are the N smallest keys of the capture and the same packets produce
-the same report in any arrival order, even cap-saturated. Anything that
+degrades instead of exhausting memory. The keyed collections (flows, assets,
+bindings, candidate sightings, subnets, and the per-asset
+hostname/service/IP sets) evict deterministically — at a cap a new key is
+admitted only by evicting the largest admitted one, so survivors are the N
+smallest keys of the capture in any arrival order. The `dns`/`dhcp` detail
+logs are chronological instead: at their cap the first N records are kept
+and the rest counted as dropped. Once any cap engages, the overflow-counter
+values tally capped events and may vary with packet order (`flows_dropped`
+is exact; zero vs nonzero is always stable), so byte-diffing capped reports
+should exclude or normalize those counters — see DESIGN.md for the
+residuals. Anything that
 degrades a run — a truncated tail, a corrupt mid-stream section header
 (concatenated pcapng), malformed blocks skipped, caps hit, records without
 timestamps (pcapng Simple Packet Blocks) — is reported as warnings on stderr

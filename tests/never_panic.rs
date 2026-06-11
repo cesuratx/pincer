@@ -4,14 +4,21 @@
 //! also counts as a panic.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
-use pincer::analysis::{AssetInventory, FlowTable, Observe, Stats};
+mod common;
+
+use pincer::analysis::{AssetInventory, FlowTable, Observe, Stats, dependency_edges};
 use pincer::app::sniff;
 use pincer::decode::decode_packet;
 use pincer::fixtures::scenarios;
+use pincer::output::{Degradation, DhcpRecord, DnsRecord, Report, deps_dot};
 use pincer::pcap::{CaptureReader, LinkType, Record};
 use proptest::prelude::*;
 
-/// Drive arbitrary bytes through the whole pipeline; never panic.
+/// Drive arbitrary bytes through the whole pipeline — reader, decoders,
+/// sniffers, sinks, and then the CLI tail the shipped binary always runs:
+/// `finalize`, dependency derivation, and every renderer (table, JSON
+/// envelope, DOT). Attacker-derived strings (hostnames, SNI, HTTP hosts) flow
+/// into the renderers, so the no-panic property must not stop at `observe`.
 fn run_pipeline(capture: &[u8]) {
     let Ok(mut reader) = CaptureReader::new(capture) else {
         return; // rejecting a bad header is fine
@@ -19,6 +26,8 @@ fn run_pipeline(capture: &[u8]) {
     let mut stats = Stats::new();
     let mut flows = FlowTable::new();
     let mut assets = AssetInventory::new();
+    let mut dns = Vec::new();
+    let mut dhcp = Vec::new();
     let mut guard = 0u32;
     loop {
         guard += 1;
@@ -30,11 +39,49 @@ fn run_pipeline(capture: &[u8]) {
                     stats.observe(&pkt, app.as_ref());
                     flows.observe(&pkt, app.as_ref());
                     assets.observe(&pkt, app.as_ref());
+                    if let Some(event) = app.as_ref() {
+                        DnsRecord::push_from(event, &mut dns);
+                        DhcpRecord::push_from(event, &mut dhcp);
+                    }
                 }
             }
             Ok(None) | Err(_) => break,
         }
     }
+
+    assets.finalize();
+    let asset_list = assets.assets();
+    let edges = dependency_edges(&flows, &assets);
+    // The same degradation facts `Pass::degradation` would report, so the
+    // PARTIAL footers and markers render under fuzz too.
+    let of = assets.overflow();
+    let degradation = Degradation {
+        skipped_blocks: reader.skipped_blocks(),
+        timestampless_records: reader.timestampless_records(),
+        flows_dropped: flows.dropped(),
+        assets_dropped: of.assets,
+        bindings_dropped: of.bindings,
+        subnets_dropped: of.subnets,
+        hostnames_dropped: of.hostnames,
+        services_dropped: of.services,
+        ips_dropped: of.ips,
+        ips_rebound: of.rebound_ips,
+        ..Degradation::default()
+    };
+    for report in [
+        Report::Summary(&stats),
+        Report::Flows(&flows),
+        Report::Assets(&asset_list),
+        Report::Services(&asset_list),
+        Report::Deps(&edges),
+        Report::Dns(&dns),
+        Report::Dhcp(&dhcp),
+    ] {
+        let _ = report.to_table(&degradation);
+        let mut json = Vec::new();
+        let _ = report.write_json(&degradation, &mut json);
+    }
+    let _ = deps_dot(&edges, &degradation);
 }
 
 /// A single Ethernet frame decoded directly; never panic. `ts: None` keeps
@@ -64,13 +111,35 @@ proptest! {
         decode_frame(&frame);
     }
 
-    /// Same property, but past the magic check: a pcapng SHB type prefix puts
-    /// the fuzz inside the section/block parsing machinery instead of
-    /// stopping at magic rejection.
+    /// A pcapng SHB type prefix, then garbage: this fuzzes the section-header
+    /// length/BOM validation itself — random bytes survive the byte-order
+    /// magic check with probability ~2⁻³¹, so the block walk is reached by
+    /// the two `valid_shb_*` variants below, not here.
     #[test]
     fn arbitrary_pcapng_section_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
         let mut file = vec![0x0A, 0x0D, 0x0D, 0x0A];
         file.extend_from_slice(&bytes);
+        run_pipeline(&file);
+    }
+
+    /// A complete valid little-endian SHB, then garbage: the fuzz lands
+    /// inside `next_record`'s block loop — framing checks, IDB option
+    /// walking, EPB/SPB body checks, and mid-stream SHB resets — instead of
+    /// dying at the BOM check.
+    #[test]
+    fn valid_shb_then_garbage_never_panics(tail in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        let mut file = common::shb_le();
+        file.extend_from_slice(&tail);
+        run_pipeline(&file);
+    }
+
+    /// Same, with an Ethernet interface declared: packet blocks that survive
+    /// the well-formedness checks now reach the decoders and sinks too.
+    #[test]
+    fn valid_shb_idb_then_garbage_never_panics(tail in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        let mut file = common::shb_le();
+        file.extend_from_slice(&common::idb_le());
+        file.extend_from_slice(&tail);
         run_pipeline(&file);
     }
 

@@ -92,7 +92,9 @@ src/
 ├── decode/           Packet layers — zero-copy borrowed views
 │   ├── mod.rs        PacketView + the layer-dispatch chain
 │   ├── ethernet.rs   Ethernet II + stacked VLAN
-│   ├── arp.rs ipv4.rs ipv6.rs tcp.rs udp.rs icmp.rs
+│   ├── sll.rs        Linux SLL/SLL2 ("cooked" capture, tcpdump -i any)
+│   ├── rawip.rs      Raw-IP and NULL/LOOP link types (VPN/tun, loopback)
+│   ├── arp.rs ipv4.rs ipv6.rs tcp.rs udp.rs sctp.rs icmp.rs
 │
 ├── app/              Application sniffers — owned summaries, best-effort
 │   ├── mod.rs        AppEvent enum + sniff() dispatch (chain of responsibility)
@@ -102,11 +104,11 @@ src/
 │   ├── mod.rs        Observe trait + service_name()
 │   ├── flows.rs      FlowTable: bidirectional 5-tuple aggregation
 │   ├── assets.rs     AssetInventory: identity resolution with evidence
-│   ├── deps.rs       Dependency edges + Graphviz export
+│   ├── deps.rs       Dependency edges (derived from flows + assets)
 │   └── stats.rs      Capture-wide counters + anomalies
 │
 ├── output/           Rendering — strategy over one Report type
-│   ├── mod.rs        Report enum → to_table() / write_json()
+│   ├── mod.rs        Report enum → to_table() / write_json(), plus deps_dot (Graphviz DOT)
 │   └── table.rs      Aligned-table renderer (no crate)
 │
 ├── fixtures/         Test data — typestate packet builder
@@ -355,8 +357,13 @@ keys them once at the end, against the complete segment set — is implemented:
 enter the inventory **only** there (a per-packet locality decision made a
 host's membership and keying depend on whether its frames preceded the
 ARP/DHCP that taught its segment). ARP/DHCP stay immediate — they speak
-authoritatively about their own segment. This deferral is what makes the
-inventory order-independent.
+authoritatively about their own segment. Conflicting candidate MACs for one
+IP (lease churn, failover, spoofing) resolve to the numerically smallest MAC
+— a function of the packet set, not arrival order — and a contested *local*
+IP counts once in `ips_rebound` at finalize, the same ambiguity signal a
+mid-capture authoritative rebind raises (off-link IPs are exempt: many
+gateway MACs legitimately front one remote IP). This deferral is what makes
+the inventory order-independent.
 
 ### Honest limitations, stated not hidden
 
@@ -365,8 +372,10 @@ inventory order-independent.
 - **No TCP stream reassembly** — HTTP/TLS detection works on the first data
   segment; otherwise the service is still found (by port + SYN-ACK) but without
   the hostname. We *report* the degradation rather than pretending.
-- **Service evidence is graded** (`SynAck` > `AppLayer` > `PortHeuristic`) so a
-  guess is never presented as a fact.
+- **Service evidence is graded** (`SynAck` > `AppLayer` > `UdpResponse` >
+  `PortHeuristic`) so a guess is never presented as a fact — `UdpResponse` is
+  a UDP listener answering an ephemeral port, UDP's closest analogue to a
+  SYN-ACK.
 - **DNS/mDNS naming evidence is trust-gated** — answer records count only in
   responses (qr=1; answers riding on queries are a poisoning shape or mDNS
   known-answer suppression, neither a claim), and only when the record names
@@ -376,15 +385,19 @@ inventory order-independent.
   Host instead. The residual exposure — an on-segment attacker naming an
   on-segment neighbor — is indistinguishable from a legitimate local resolver
   by passive evidence alone.
-- **Caps evict deterministically** — every `analysis::Limits` collection
-  (flows, assets, bindings, candidate sightings, subnets, and the per-asset
-  hostname/service/IP sets) admits by key order once full: a new key replaces
-  the largest admitted one only if it sorts before it, so the survivors are
-  always the N smallest keys the capture offered — identical across packet
-  reorderings — and `flows_dropped` counts exactly the packets of flows
-  missing from the final table. Permutation proptests pin this
-  (tests/determinism.rs: shuffled cap-exceeding captures must render
-  byte-identical reports). Residual order dependence under an engaged cap,
+- **Caps evict deterministically** — every keyed `analysis::Limits`
+  collection (flows, assets, bindings, candidate sightings, subnets, and the
+  per-asset hostname/service/IP sets) admits by key order once full: a new
+  key replaces the largest admitted one only if it sorts before it, so the
+  survivors are always the N smallest keys the capture offered — identical
+  across packet reorderings — and `flows_dropped` counts exactly the packets
+  of flows missing from the final table. The `dns`/`dhcp` detail logs are the
+  exception: they are chronological, keeping the first
+  `max_dns_records`/`max_dhcp_records` records and counting the rest, so a
+  capped detail log is the stream prefix and varies with packet order.
+  Permutation proptests pin the keyed behavior (tests/determinism.rs:
+  shuffled cap-exceeding captures must render byte-identical reports).
+  Residual order dependence under an engaged cap,
   stated rather than implied away: evidence already merged through a binding
   or asset that a smaller key later evicts cannot be unmerged (such a host can
   split into MAC- and IP-keyed records), and the other overflow-counter
@@ -437,14 +450,17 @@ the *library*, where untrusted input lands.
 The payoff is concrete: because of these rules, the claim "no input can panic
 this program" is first made *provable* (audit one file, trust the compiler for
 the rest) and then *proven* by `tests/never_panic.rs`, which throws random
-bytes, valid-header-plus-garbage, and every truncation and bit-flip of the
-office capture at the whole pipeline.
+bytes, valid-header-plus-garbage (legacy global header, pcapng SHB, and
+SHB+IDB prefixes, so the fuzz reaches the block walk), and every truncation
+and bit-flip of the office capture at the whole pipeline — through `finalize`,
+dependency derivation, and every renderer (table, JSON envelope, DOT), the
+same tail the shipped binary runs.
 
 ---
 
 ## 8. Testing strategy (how we trust it)
 
-Four layers, each catching a different failure class:
+Five layers, each catching a different failure class:
 
 1. **Hex-fixture unit tests** ([tests/decode_layers.rs](tests/decode_layers.rs))
    — hand-assembled packets with byte-offset comments; the test you read to
@@ -455,9 +471,18 @@ Four layers, each catching a different failure class:
    `laptop → example.com:443` edge with SNI; the gateway didn't absorb off-link
    IPs).
 3. **Differential tests** ([tests/differential.rs](tests/differential.rs)) — our
-   decoders vs `etherparse` on the same frames. Catches "I misread the spec."
+   decoders vs `etherparse` on the same frames (including ARP, IPv4 options,
+   QinQ, IPv6 extension headers, ICMP/ICMPv6), plus a generative oracle: etherparse
+   *builds* random valid packets and pincer must agree on the 5-tuple and
+   payload boundary. Catches "I misread the spec."
 4. **Property tests** ([tests/never_panic.rs](tests/never_panic.rs)) — the
    never-panic proof, via fuzzing.
+5. **Coverage-guided fuzzing** ([fuzz/](fuzz/)) — five cargo-fuzz/libFuzzer
+   targets (full pipeline, each container format behind a valid header
+   prefix, the DNS parser, the link-type decode fan-out), run ad hoc on
+   nightly (see README § Fuzzing). Coverage feedback penetrates the
+   magic/length gates that blind random generation in layer 4 statistically
+   cannot.
 
 Plus a **round-trip guarantee**: the committed sample captures are byte-identical
 to what the fixture builder generates (a test enforces it), so the samples can
