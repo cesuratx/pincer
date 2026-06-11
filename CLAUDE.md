@@ -39,8 +39,8 @@ sync (a test enforces byte-identity).
 - `bytes.rs` — `Cursor`, the **only** place raw packet bytes are read. Bounds-checked, returns `Result`, never panics. Everything rests on this.
 - `error.rs` — three error tiers: `PcapError` (container, aborts the stream), `DecodeError` (one packet, never aborts), and `Option::None` from app sniffers ("not this protocol", not an error).
 - `pcap/` — streaming `CaptureReader` (legacy + pcapng) and a legacy `writer`. Lending iterator: one reusable buffer, constant memory on any file size.
-- `decode/` — zero-copy layer views: Ethernet/VLAN, ARP, IPv4, IPv6, TCP, UDP, ICMP. Borrow the buffer; allocate nothing.
-- `app/` — best-effort sniffers returning **owned** `AppEvent`: DNS/mDNS, DHCP, HTTP, TLS SNI. This owned/borrowed boundary is deliberate.
+- `decode/` — zero-copy layer views: Ethernet/VLAN, SLL/SLL2 (Linux cooked), raw-IP/null/loop link types, ARP, IPv4, IPv6, TCP, UDP, SCTP (ports), ICMP. Borrow the buffer; allocate nothing.
+- `app/` — best-effort sniffers returning **owned** `AppEvent`: DNS/mDNS/LLMNR, DHCP, HTTP, TLS SNI. This owned/borrowed boundary is deliberate.
 - `analysis/` — `Observe` sinks run in a single pass: `flows`, `assets`, `stats`; `deps` is *derived* from flows + assets after the pass.
 - `output/` — table / JSON renderers behind one `Report` type, plus the standalone DOT renderer (`deps_dot`).
 - `fixtures/` — typestate packet builder + `scenarios` (office, incident). Powers tests and `gen`.

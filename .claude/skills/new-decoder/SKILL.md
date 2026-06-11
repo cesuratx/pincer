@@ -14,8 +14,9 @@ parser.
 - **Application-layer sniffer** (most common: NTP, SNMP, SSDP, NetBIOS-NS, …)
   → add a module under `src/app/`, return an owned summary, wire into the
   chain in `src/app/mod.rs::sniff`.
-- **Transport/network layer** (rare: SCTP, GRE) → add under `src/decode/`,
-  add a `*View` variant and a dispatch arm in `src/decode/mod.rs`.
+- **Transport/network layer** (rare: GRE, OSPF, ESP) → add under `src/decode/`,
+  add a `*View` variant and a dispatch arm in `src/decode/mod.rs`. See
+  `src/decode/sctp.rs` for the smallest existing reference implementation.
 
 This skill assumes an app-layer sniffer; adjust for a packet layer.
 
