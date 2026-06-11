@@ -437,8 +437,11 @@ the *library*, where untrusted input lands.
 The payoff is concrete: because of these rules, the claim "no input can panic
 this program" is first made *provable* (audit one file, trust the compiler for
 the rest) and then *proven* by `tests/never_panic.rs`, which throws random
-bytes, valid-header-plus-garbage, and every truncation and bit-flip of the
-office capture at the whole pipeline.
+bytes, valid-header-plus-garbage (legacy global header, pcapng SHB, and
+SHB+IDB prefixes, so the fuzz reaches the block walk), and every truncation
+and bit-flip of the office capture at the whole pipeline — through `finalize`,
+dependency derivation, and every renderer (table, JSON envelope, DOT), the
+same tail the shipped binary runs.
 
 ---
 
@@ -455,7 +458,10 @@ Four layers, each catching a different failure class:
    `laptop → example.com:443` edge with SNI; the gateway didn't absorb off-link
    IPs).
 3. **Differential tests** ([tests/differential.rs](tests/differential.rs)) — our
-   decoders vs `etherparse` on the same frames. Catches "I misread the spec."
+   decoders vs `etherparse` on the same frames (including IPv4 options, QinQ,
+   IPv6 extension headers, ICMP/ICMPv6), plus a generative oracle: etherparse
+   *builds* random valid packets and pincer must agree on the 5-tuple and
+   payload boundary. Catches "I misread the spec."
 4. **Property tests** ([tests/never_panic.rs](tests/never_panic.rs)) — the
    never-panic proof, via fuzzing.
 

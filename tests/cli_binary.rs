@@ -9,6 +9,8 @@
     clippy::indexing_slicing
 )]
 
+mod common;
+
 use std::process::{Command, Output};
 
 const OFFICE: &str = "testdata/office.pcap";
@@ -226,6 +228,75 @@ fn dot_partial_header_appears_exactly_when_degraded() {
     );
     assert!(dot.contains("digraph dependencies {"));
     assert!(dot.trim_end().ends_with('}'), "still valid Graphviz");
+}
+
+/// The degrade-don't-discard contract end to end: a capture cut mid-record
+/// exits 0, the warning lands on stderr, the envelope flips `truncated_tail`,
+/// and stdout stays pure JSON — no warning text for a consumer to choke on.
+#[test]
+fn truncated_capture_warns_on_stderr_and_flags_the_envelope() {
+    let trunc = truncated_office("warn");
+    let out = pincer(&["summary", trunc.to_str().unwrap(), "--json"]);
+    std::fs::remove_file(&trunc).ok();
+
+    assert_eq!(out.status.code(), Some(0), "degraded is not broken");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("pincer: warning:") && stderr.contains("truncated record"),
+        "stderr must carry the truncation warning: {stderr}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("warning"),
+        "warnings must never leak into stdout: {stdout}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is pure JSON");
+    assert_eq!(
+        json.pointer("/degradation/truncated_tail"),
+        Some(&serde_json::Value::Bool(true)),
+        "the envelope must flag the truncated tail"
+    );
+}
+
+/// A well-framed pcapng whose SPB body is too short for its own `orig_len`
+/// field is per-packet damage: the reader skips it, the count reaches both
+/// stderr and the envelope, and the valid packet after it survives.
+#[test]
+fn malformed_spb_is_skipped_counted_and_warned() {
+    let mut file = common::shb_le();
+    file.extend_from_slice(&common::idb_le());
+    // SPB framing claiming total_len 12: a zero-byte body with no room for
+    // the mandatory orig_len field.
+    file.extend_from_slice(&3u32.to_le_bytes());
+    file.extend_from_slice(&12u32.to_le_bytes());
+    file.extend_from_slice(&12u32.to_le_bytes());
+    file.extend_from_slice(&common::epb_le(0, 0, &common::udp_frame(40000)));
+
+    let out = common::run_on("bad-spb", &file, &["summary", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a skipped block degrades, never breaks: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json.pointer("/degradation/skipped_blocks")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the skipped block must reach the envelope"
+    );
+    assert_eq!(
+        json.pointer("/data/packets")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the valid packet after the bad SPB must survive"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("malformed packet block"),
+        "stderr must warn about the skipped block: {stderr}"
+    );
 }
 
 /// The envelope's byte order is the salvage contract: `degradation` must

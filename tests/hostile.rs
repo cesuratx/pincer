@@ -5,6 +5,8 @@
 //! separates a demo from a sensor you can point at a live network.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod common;
+
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use pincer::analysis::{AssetInventory, FlowTable, Limits, Observe};
@@ -279,17 +281,7 @@ mod pcapng_hostile {
     use pincer::error::PcapError;
     use pincer::pcap::CaptureReader;
 
-    /// Minimal little-endian SHB (28 bytes, no options).
-    fn shb_le() -> Vec<u8> {
-        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
-        b.extend_from_slice(&28u32.to_le_bytes());
-        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&(-1i64).to_le_bytes());
-        b.extend_from_slice(&28u32.to_le_bytes());
-        b
-    }
+    use crate::common::shb_le;
 
     /// A block whose header *claims* `total_len`, regardless of the body.
     fn lying_block(block_type: u32, total_len: u32, body: &[u8]) -> Vec<u8> {
@@ -417,85 +409,9 @@ mod pcapng_hostile {
 // ---------------------------------------------------------------------------
 
 mod spb_timestamps {
-    use std::net::Ipv4Addr;
-    use std::process::{Command, Output};
-
     use pincer::pcap::CaptureReader;
-    use pincer::types::MacAddr;
 
-    fn shb_le() -> Vec<u8> {
-        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
-        b.extend_from_slice(&28u32.to_le_bytes());
-        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&(-1i64).to_le_bytes());
-        b.extend_from_slice(&28u32.to_le_bytes());
-        b
-    }
-
-    fn idb_le() -> Vec<u8> {
-        let mut b = 1u32.to_le_bytes().to_vec();
-        b.extend_from_slice(&20u32.to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&20u32.to_le_bytes());
-        b
-    }
-
-    /// EPB stamped at `ticks` µs since the epoch (the IDB default resolution).
-    fn epb_le(ticks: u64, data: &[u8]) -> Vec<u8> {
-        let cap = u32::try_from(data.len()).unwrap();
-        let padded = data.len().next_multiple_of(4);
-        let total = u32::try_from(32 + padded).unwrap();
-        let mut b = 6u32.to_le_bytes().to_vec();
-        b.extend_from_slice(&total.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes()); // interface_id
-        b.extend_from_slice(&u32::try_from(ticks >> 32).unwrap().to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)]
-        b.extend_from_slice(&(ticks as u32).to_le_bytes());
-        b.extend_from_slice(&cap.to_le_bytes());
-        b.extend_from_slice(&cap.to_le_bytes());
-        b.extend_from_slice(data);
-        b.resize(b.len() + (padded - data.len()), 0);
-        b.extend_from_slice(&total.to_le_bytes());
-        b
-    }
-
-    /// SPB: original length, then data padded to 4 bytes — no timestamp field.
-    fn spb_le(data: &[u8]) -> Vec<u8> {
-        let padded = data.len().next_multiple_of(4);
-        let total = u32::try_from(16 + padded).unwrap();
-        let mut b = 3u32.to_le_bytes().to_vec();
-        b.extend_from_slice(&total.to_le_bytes());
-        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
-        b.extend_from_slice(data);
-        b.resize(b.len() + (padded - data.len()), 0);
-        b.extend_from_slice(&total.to_le_bytes());
-        b
-    }
-
-    /// A decodable UDP frame so the analysis sinks actually fold the record.
-    fn udp_frame(src_port: u16) -> Vec<u8> {
-        pincer::fixtures::Packet::ethernet(MacAddr([2, 0, 0, 0, 0, 1]), MacAddr([2, 0, 0, 0, 0, 2]))
-            .ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2))
-            .udp(src_port, 53)
-            .payload(b"x")
-    }
-
-    /// Write a capture to a temp file and run the real binary on it.
-    fn run_on(tag: &str, capture: &[u8], args: &[&str]) -> Output {
-        let path = std::env::temp_dir().join(format!("pincer-{tag}-{}.pcapng", std::process::id()));
-        std::fs::write(&path, capture).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_pincer"))
-            .args(args)
-            .arg(&path)
-            .output()
-            .expect("binary must run");
-        std::fs::remove_file(&path).ok();
-        out
-    }
+    use crate::common::{epb_le, idb_le, run_on, shb_le, spb_le, udp_frame};
 
     /// The reader carries timestamp absence in the type and counts it — it
     /// never invents an epoch value for a block that has no timestamp field.
@@ -585,9 +501,9 @@ mod spb_timestamps {
         let base_us = 1_000_000_000u64 * 1_000_000; // 2001-09-09, in µs ticks
         let mut file = shb_le();
         file.extend_from_slice(&idb_le());
-        file.extend_from_slice(&epb_le(base_us, &udp_frame(40000)));
+        file.extend_from_slice(&epb_le(0, base_us, &udp_frame(40000)));
         file.extend_from_slice(&spb_le(&udp_frame(40001)));
-        file.extend_from_slice(&epb_le(base_us + 100_000_000, &udp_frame(40002)));
+        file.extend_from_slice(&epb_le(0, base_us + 100_000_000, &udp_frame(40002)));
 
         let out = run_on("mixed-epb-spb", &file, &["summary", "--json"]);
         assert!(out.status.success());
@@ -624,8 +540,8 @@ mod spb_timestamps {
     fn clock_inconsistency_is_machine_readable() {
         let mut file = shb_le();
         file.extend_from_slice(&idb_le());
-        file.extend_from_slice(&epb_le(1_000_000_000u64 * 1_000_000, &udp_frame(40000)));
-        file.extend_from_slice(&epb_le(1_200_000_000u64 * 1_000_000, &udp_frame(40001)));
+        file.extend_from_slice(&epb_le(0, 1_000_000_000u64 * 1_000_000, &udp_frame(40000)));
+        file.extend_from_slice(&epb_le(0, 1_200_000_000u64 * 1_000_000, &udp_frame(40001)));
 
         let out = run_on("clock-skew-json", &file, &["summary", "--json"]);
         assert!(out.status.success());
@@ -647,41 +563,7 @@ mod pcapng_framing {
     use pincer::error::PcapError;
     use pincer::pcap::CaptureReader;
 
-    fn shb_le() -> Vec<u8> {
-        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
-        b.extend_from_slice(&28u32.to_le_bytes());
-        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&(-1i64).to_le_bytes());
-        b.extend_from_slice(&28u32.to_le_bytes());
-        b
-    }
-
-    fn idb_le() -> Vec<u8> {
-        let mut b = 1u32.to_le_bytes().to_vec();
-        b.extend_from_slice(&20u32.to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&20u32.to_le_bytes());
-        b
-    }
-
-    fn epb_le(iface: u32, data: &[u8]) -> Vec<u8> {
-        let cap = u32::try_from(data.len()).unwrap();
-        let padded = data.len().next_multiple_of(4);
-        let total = u32::try_from(32 + padded).unwrap();
-        let mut b = 6u32.to_le_bytes().to_vec();
-        b.extend_from_slice(&total.to_le_bytes());
-        for field in [iface, 0, 0, cap, cap] {
-            b.extend_from_slice(&field.to_le_bytes());
-        }
-        b.extend_from_slice(data);
-        b.resize(b.len() + (padded - data.len()), 0);
-        b.extend_from_slice(&total.to_le_bytes());
-        b
-    }
+    use crate::common::{epb_le, idb_le, shb_le};
 
     /// A trailing Block Total Length that disagrees with the leading one means
     /// the framing itself is corrupt — the stream must stop with an error, not
@@ -690,7 +572,7 @@ mod pcapng_framing {
     fn trailing_length_mismatch_is_fatal_framing_damage() {
         let mut file = shb_le();
         file.extend_from_slice(&idb_le());
-        let mut epb = epb_le(0, &[1, 2, 3, 4]);
+        let mut epb = epb_le(0, 0, &[1, 2, 3, 4]);
         let n = epb.len();
         epb.get_mut(n - 4..)
             .unwrap()
@@ -711,8 +593,8 @@ mod pcapng_framing {
     fn epb_with_undeclared_interface_is_skipped_and_counted() {
         let mut file = shb_le();
         file.extend_from_slice(&idb_le()); // declares interface 0 only
-        file.extend_from_slice(&epb_le(7, &[1, 2, 3, 4])); // references 7
-        file.extend_from_slice(&epb_le(0, &[5, 6, 7, 8])); // valid
+        file.extend_from_slice(&epb_le(7, 0, &[1, 2, 3, 4])); // references 7
+        file.extend_from_slice(&epb_le(0, 0, &[5, 6, 7, 8])); // valid
         let mut reader = CaptureReader::new(file.as_slice()).unwrap();
         let rec = reader.next_record().unwrap().expect("valid EPB survives");
         assert_eq!(rec.data, &[5, 6, 7, 8]);
@@ -728,7 +610,7 @@ mod pcapng_framing {
         for _ in 0..5000 {
             file.extend_from_slice(&idb_le());
         }
-        file.extend_from_slice(&epb_le(0, &[9, 9, 9, 9]));
+        file.extend_from_slice(&epb_le(0, 0, &[9, 9, 9, 9]));
         let mut reader = CaptureReader::new(file.as_slice()).unwrap();
         let rec = reader.next_record().unwrap().expect("packet still decodes");
         assert_eq!(rec.data, &[9, 9, 9, 9]);
@@ -745,46 +627,7 @@ mod pcapng_framing {
 // ---------------------------------------------------------------------------
 
 mod damaged_sections {
-    use std::net::Ipv4Addr;
-    use std::process::{Command, Output};
-
-    use pincer::types::MacAddr;
-
-    fn shb_le() -> Vec<u8> {
-        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
-        b.extend_from_slice(&28u32.to_le_bytes());
-        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&(-1i64).to_le_bytes());
-        b.extend_from_slice(&28u32.to_le_bytes());
-        b
-    }
-
-    fn idb_le() -> Vec<u8> {
-        let mut b = 1u32.to_le_bytes().to_vec();
-        b.extend_from_slice(&20u32.to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&20u32.to_le_bytes());
-        b
-    }
-
-    fn epb_le(data: &[u8]) -> Vec<u8> {
-        let cap = u32::try_from(data.len()).unwrap();
-        let padded = data.len().next_multiple_of(4);
-        let total = u32::try_from(32 + padded).unwrap();
-        let mut b = 6u32.to_le_bytes().to_vec();
-        b.extend_from_slice(&total.to_le_bytes());
-        for field in [0u32, 0, 0, cap, cap] {
-            b.extend_from_slice(&field.to_le_bytes());
-        }
-        b.extend_from_slice(data);
-        b.resize(b.len() + (padded - data.len()), 0);
-        b.extend_from_slice(&total.to_le_bytes());
-        b
-    }
+    use crate::common::{epb_le, idb_le, run_on, shb_le, udp_frame};
 
     /// SHB framing whose byte-order magic is garbage in both endiannesses —
     /// the 12 corrupt bytes the audit appends to a valid section.
@@ -808,33 +651,14 @@ mod damaged_sections {
         b
     }
 
-    fn udp_frame(src_port: u16) -> Vec<u8> {
-        pincer::fixtures::Packet::ethernet(MacAddr([2, 0, 0, 0, 0, 1]), MacAddr([2, 0, 0, 0, 0, 2]))
-            .ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2))
-            .udp(src_port, 53)
-            .payload(b"x")
-    }
-
     /// One valid section carrying two packets, then a damaged second SHB.
     fn capture_with_damaged_tail(bad_shb: &[u8]) -> Vec<u8> {
         let mut file = shb_le();
         file.extend_from_slice(&idb_le());
-        file.extend_from_slice(&epb_le(&udp_frame(40000)));
-        file.extend_from_slice(&epb_le(&udp_frame(40001)));
+        file.extend_from_slice(&epb_le(0, 0, &udp_frame(40000)));
+        file.extend_from_slice(&epb_le(0, 0, &udp_frame(40001)));
         file.extend_from_slice(bad_shb);
         file
-    }
-
-    fn run_on(tag: &str, capture: &[u8], args: &[&str]) -> Output {
-        let path = std::env::temp_dir().join(format!("pincer-{tag}-{}.pcapng", std::process::id()));
-        std::fs::write(&path, capture).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_pincer"))
-            .args(args)
-            .arg(&path)
-            .output()
-            .expect("binary must run");
-        std::fs::remove_file(&path).ok();
-        out
     }
 
     /// A corrupt second SHB (`BadMagic` mid-stream) must degrade, not discard:
