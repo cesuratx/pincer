@@ -1,5 +1,8 @@
 # pincer
 
+[![CI](https://github.com/cesuratx/pincer/actions/workflows/ci.yml/badge.svg)](https://github.com/cesuratx/pincer/actions/workflows/ci.yml)
+[![Security audit](https://github.com/cesuratx/pincer/actions/workflows/audit.yml/badge.svg)](https://github.com/cesuratx/pincer/actions/workflows/audit.yml)
+
 A hand-rolled pcap/pcapng analyzer in Rust for **passive asset discovery**: it
 turns a network capture into communication **flows**, an **asset inventory**,
 and an **application dependency map** — no libpcap, no packet-parsing crates.
