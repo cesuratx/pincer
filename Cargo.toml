@@ -1,0 +1,42 @@
+[package]
+name = "pincer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Hand-rolled pcap analyzer: flows, assets, and dependency maps from network captures"
+license = "MIT"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# pedantic lints we deliberately opt out of:
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+cast_precision_loss = "allow"
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+etherparse = "0.20.1"
+proptest = "1.11.0"
