@@ -73,7 +73,9 @@ pub fn parse<'a>(cur: &mut Cursor<'a>) -> Result<Ipv4View<'a>, DecodeError> {
     };
     let available = cur.remaining();
     // Ethernet pads short frames to 60 bytes: trust total_length as the upper
-    // bound so padding never leaks into the transport payload.
+    // bound so padding never leaks into the transport payload. (The offload
+    // total_length == 0 path has no bound to trust — padding could leak
+    // there, but offload frames are large and never minimum-frame-padded.)
     let payload = cur.take(declared_payload.min(available))?;
 
     Ok(Ipv4View {

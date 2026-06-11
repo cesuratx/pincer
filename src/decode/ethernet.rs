@@ -12,6 +12,9 @@ pub const ETHERTYPE_IPV6: u16 = 0x86DD;
 const ETHERTYPE_VLAN_C: u16 = 0x8100; // 802.1Q customer tag
 const ETHERTYPE_VLAN_S: u16 = 0x88A8; // 802.1ad service tag (QinQ)
 const ETHERTYPE_VLAN_LEGACY_QINQ: u16 = 0x9100;
+// Pre-standard QinQ TPIDs still emitted by some metro-Ethernet gear.
+const ETHERTYPE_VLAN_LEGACY_QINQ2: u16 = 0x9200;
+const ETHERTYPE_VLAN_LEGACY_QINQ3: u16 = 0x9300;
 
 /// Up to four stacked VLAN IDs without heap allocation.
 #[derive(Debug, Clone, Copy, Default)]
@@ -21,14 +24,16 @@ pub struct VlanStack {
 }
 
 impl VlanStack {
-    fn push(&mut self, vid: u16) -> Result<(), DecodeError> {
-        let slot = self
-            .ids
-            .get_mut(usize::from(self.len))
-            .ok_or_else(|| DecodeError::malformed("ethernet", "vlan stack deeper than 4"))?;
-        *slot = vid;
-        self.len = self.len.saturating_add(1);
-        Ok(())
+    const fn is_full(&self) -> bool {
+        self.len >= 4
+    }
+
+    /// No-op when full — the walk checks `is_full` first and degrades.
+    fn push(&mut self, vid: u16) {
+        if let Some(slot) = self.ids.get_mut(usize::from(self.len)) {
+            *slot = vid;
+            self.len = self.len.saturating_add(1);
+        }
     }
 
     #[must_use]
@@ -76,10 +81,21 @@ pub(crate) fn walk_vlan_chain(
     let mut vlan = VlanStack::default();
     while matches!(
         ethertype,
-        ETHERTYPE_VLAN_C | ETHERTYPE_VLAN_S | ETHERTYPE_VLAN_LEGACY_QINQ
+        ETHERTYPE_VLAN_C
+            | ETHERTYPE_VLAN_S
+            | ETHERTYPE_VLAN_LEGACY_QINQ
+            | ETHERTYPE_VLAN_LEGACY_QINQ2
+            | ETHERTYPE_VLAN_LEGACY_QINQ3
     ) {
+        if vlan.is_full() {
+            // Deeper than anything a real network stacks: stop and surface
+            // what we decoded — the TPID becomes the (unknown) ethertype,
+            // keeping the MACs and four tags instead of discarding the
+            // whole frame as malformed.
+            break;
+        }
         let tci = cur.u16_be()?;
-        vlan.push(tci & 0x0FFF)?;
+        vlan.push(tci & 0x0FFF);
         ethertype = cur.u16_be()?;
     }
     Ok((ethertype, vlan))

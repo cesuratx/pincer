@@ -1,6 +1,8 @@
 //! Hand-written hex fixtures with byte-offset comments, plus reader tests for
-//! every pcap container variant. These pin the exact wire layout each decoder
-//! must accept — the test you read to understand the format.
+//! the legacy pcap container variants. (Adversarial pcapng coverage — block
+//! length lies, big-endian sections, SPB abuse — lives in `hostile.rs`.)
+//! These pin the exact wire layout each decoder must accept — the test you
+//! read to understand the format.
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
@@ -354,4 +356,98 @@ fn udp_length_beyond_capture_marks_packet_truncated() {
         pkt.truncated,
         "UDP payload truncation must propagate to PacketView.truncated"
     );
+}
+
+/// Real SYN/data segments virtually always carry TCP options. The data-offset
+/// arithmetic decides where the payload begins — and therefore what the
+/// HTTP/TLS sniffers read. Until this test, no committed fixture exercised an
+/// offset above 5.
+#[test]
+fn tcp_options_shift_the_payload_not_the_sniffers() {
+    use pincer::app::{AppEvent, sniff};
+    use pincer::fixtures::Packet;
+    use pincer::pcap::{LinkType, Record};
+    use pincer::types::{MacAddr, Timestamp};
+
+    // MSS(4) + NOP + NOP + SACK-permitted(2) = 8 option bytes → offset 7.
+    let options = [2, 4, 0x05, 0xB4, 1, 1, 4, 2];
+    let http = b"GET /probe HTTP/1.1\r\nHost: options.test\r\n\r\n";
+    let frame = Packet::ethernet(MacAddr([2, 0, 0, 0, 0, 1]), MacAddr([2, 0, 0, 0, 0, 2]))
+        .ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2))
+        .tcp(40000, 80)
+        .tcp_options(&options)
+        .payload(http);
+
+    let record = Record {
+        ts: Timestamp::ZERO,
+        orig_len: u32::try_from(frame.len()).unwrap(),
+        link_type: LinkType::Ethernet,
+        data: &frame,
+    };
+    let pkt = decode_packet(&record).unwrap();
+    let Some(TransportView::Tcp(tcp)) = &pkt.transport else {
+        panic!("expected TCP, got {:?}", pkt.transport);
+    };
+    assert_eq!(
+        tcp.payload, http,
+        "payload must start after the options, not inside them"
+    );
+
+    let Some(AppEvent::Http(req)) = sniff(&pkt) else {
+        panic!("HTTP must be sniffed through a data offset > 5");
+    };
+    assert_eq!(req.host.as_deref(), Some("options.test"));
+}
+
+/// The first fragment of a fragmented UDP datagram carries a UDP length that
+/// describes the WHOLE datagram. The missing bytes are in later fragments,
+/// not lost to snaplen — an intact capture must not count it as truncated.
+#[test]
+fn udp_first_fragment_is_not_truncation() {
+    let mut frame = UDP_FRAME.to_vec();
+    frame[20] = 0x20; // flags = MF, offset 0: first fragment of many
+    frame[21] = 0x00;
+    // UDP length claims the full (larger) datagram.
+    frame[38] = 0x04;
+    frame[39] = 0x00; // length = 1024
+    let pkt = decode_packet(&record(&frame)).unwrap();
+    let NetView::Ipv4(ip) = &pkt.net else {
+        panic!("ipv4")
+    };
+    assert!(ip.is_fragmented() && !ip.is_fragment_continuation());
+    assert!(
+        !pkt.truncated,
+        "fragmentation is not truncation on an intact capture"
+    );
+}
+
+/// A legacy record whose `incl_len` exceeds its `orig_len` is a writer lie; the
+/// reader must normalize `orig_len` up so the truncation flag cannot misfire.
+#[test]
+fn legacy_incl_len_above_orig_len_is_normalized() {
+    let mut file = Vec::new();
+    // Global header: LE µs magic, v2.4, zone/sigfigs 0, snaplen, DLT 1.
+    file.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
+    file.extend_from_slice(&2u16.to_le_bytes());
+    file.extend_from_slice(&4u16.to_le_bytes());
+    file.extend_from_slice(&0u32.to_le_bytes());
+    file.extend_from_slice(&0u32.to_le_bytes());
+    file.extend_from_slice(&65535u32.to_le_bytes());
+    file.extend_from_slice(&1u32.to_le_bytes());
+    // Record header: ts 0.0, incl_len = frame len, orig_len lies smaller.
+    let frame_len = u32::try_from(UDP_FRAME.len()).unwrap();
+    file.extend_from_slice(&0u32.to_le_bytes());
+    file.extend_from_slice(&0u32.to_le_bytes());
+    file.extend_from_slice(&frame_len.to_le_bytes());
+    file.extend_from_slice(&(frame_len - 10).to_le_bytes()); // the lie
+    file.extend_from_slice(UDP_FRAME);
+
+    let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+    let rec = reader.next_record().unwrap().expect("one record");
+    assert_eq!(
+        rec.orig_len, frame_len,
+        "orig_len normalized to >= incl_len"
+    );
+    let pkt = decode_packet(&rec).unwrap();
+    assert!(!pkt.truncated, "normalized record is not truncated");
 }

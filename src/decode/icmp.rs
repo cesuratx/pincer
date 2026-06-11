@@ -11,22 +11,13 @@ pub struct IcmpView {
     pub code: u8,
 }
 
-impl IcmpView {
-    /// Echo request/reply — visible host-liveness probing.
-    #[must_use]
-    pub const fn is_echo(&self) -> bool {
-        if self.v6 {
-            matches!(self.icmp_type, 128 | 129)
-        } else {
-            matches!(self.icmp_type, 0 | 8)
-        }
-    }
-}
-
 pub fn parse(cur: &mut Cursor<'_>, v6: bool) -> Result<IcmpView, DecodeError> {
+    let icmp_type = cur.u8()?;
+    let code = cur.u8()?;
+    cur.u16_be()?; // checksum — also enforces the 4-byte minimum header
     Ok(IcmpView {
         v6,
-        icmp_type: cur.u8()?,
-        code: cur.u8()?,
+        icmp_type,
+        code,
     })
 }

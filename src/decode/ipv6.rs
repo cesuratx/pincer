@@ -17,6 +17,9 @@ pub struct Ipv6View<'a> {
     /// A fragment header with offset > 0: the payload is the middle of a
     /// datagram and carries **no** transport header.
     pub fragment_continuation: bool,
+    /// Any fragment header was present — also true for the *first* fragment,
+    /// whose transport length fields describe the whole datagram.
+    pub fragmented: bool,
     pub payload: &'a [u8],
     pub payload_truncated: bool,
 }
@@ -64,9 +67,14 @@ pub fn parse<'a>(cur: &mut Cursor<'a>) -> Result<Ipv6View<'a>, DecodeError> {
     let mut inner = Cursor::new(bounded);
     let mut hops = 0u8;
     let mut fragment_continuation = false;
+    let mut fragmented = false;
     loop {
         if hops >= MAX_EXT_HEADERS {
-            return Err(DecodeError::malformed("ipv6", "extension chain too long"));
+            // Longer than anything legitimate: stop walking and degrade —
+            // the un-walked header number lands in `next_header`, transport
+            // becomes `Other`, and the already-parsed src/dst survive
+            // instead of the whole packet counting as malformed.
+            break;
         }
         match next_header {
             EXT_HOP_BY_HOP | EXT_ROUTING | EXT_DEST_OPTS => {
@@ -81,6 +89,7 @@ pub fn parse<'a>(cur: &mut Cursor<'a>) -> Result<Ipv6View<'a>, DecodeError> {
                 inner.u8()?; // reserved
                 let offset_flags = inner.u16_be()?;
                 inner.skip(4)?; // identification
+                fragmented = true;
                 // High 13 bits are the fragment offset (in 8-byte units). A
                 // non-zero offset means this is the *middle* of a datagram:
                 // what follows is payload bytes, not headers — the same trap
@@ -101,6 +110,7 @@ pub fn parse<'a>(cur: &mut Cursor<'a>) -> Result<Ipv6View<'a>, DecodeError> {
         next_header,
         hop_limit,
         fragment_continuation,
+        fragmented,
         payload: inner.rest(),
         payload_truncated,
     })

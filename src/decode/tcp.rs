@@ -17,6 +17,9 @@ impl TcpFlags {
     pub const PSH: Self = Self(0x08);
     pub const ACK: Self = Self(0x10);
     pub const URG: Self = Self(0x20);
+    /// ECN-Echo. (The NS bit lives in the data-offset byte, outside this u8.)
+    pub const ECE: Self = Self(0x40);
+    pub const CWR: Self = Self(0x80);
 
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
@@ -43,13 +46,15 @@ impl TcpFlags {
 
 impl fmt::Display for TcpFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const NAMES: [(u8, &str); 6] = [
+        const NAMES: [(u8, &str); 8] = [
             (0x02, "SYN"),
             (0x10, "ACK"),
             (0x01, "FIN"),
             (0x04, "RST"),
             (0x08, "PSH"),
             (0x20, "URG"),
+            (0x40, "ECE"),
+            (0x80, "CWR"),
         ];
         let mut first = true;
         for (bit, name) in NAMES {
@@ -95,13 +100,14 @@ pub fn parse<'a>(cur: &mut Cursor<'a>) -> Result<TcpView<'a>, DecodeError> {
     }
     cur.skip(data_offset.saturating_sub(20))?; // options
 
-    #[allow(clippy::cast_possible_truncation)]
+    // Masked to one byte, so the conversion cannot fail or truncate.
+    let flags = TcpFlags(u8::try_from(off_flags & 0xFF).unwrap_or(0));
     Ok(TcpView {
         src_port,
         dst_port,
         seq,
         ack,
-        flags: TcpFlags((off_flags & 0xFF) as u8),
+        flags,
         window,
         payload: cur.rest(),
     })

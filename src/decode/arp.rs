@@ -30,7 +30,13 @@ pub fn parse(cur: &mut Cursor<'_>) -> Result<ArpView, DecodeError> {
     let hlen = cur.u8()?;
     let plen = cur.u8()?;
     if htype != 1 || ptype != super::ethernet::ETHERTYPE_IPV4 || hlen != 6 || plen != 4 {
-        return Err(DecodeError::malformed("arp", "not IPv4-over-Ethernet"));
+        // Spec-valid ARP for pairs we do not decode (InfiniBand, IPX, ...).
+        // decode::mod matches this exact reason to classify the packet as
+        // Unknown rather than Malformed — it is not a lying packet.
+        return Err(DecodeError::malformed(
+            "arp",
+            "unsupported hardware/protocol",
+        ));
     }
 
     let op = match cur.u16_be()? {
