@@ -59,6 +59,7 @@ sync (a test enforces byte-identity).
 - No IP fragment reassembly. Non-first fragments are excluded from transport parsing.
 - No TCP stream reassembly. HTTP/TLS detection works on the **first** data segment of a connection; otherwise the flow degrades to port + SYN-ACK evidence.
 - MAC↔IP binding is gated on L2 locality (a router's MAC fronts many off-link IPs); off-link hosts are keyed by IP. Local segments come from DHCP option 1 (real mask) or ARP (/24 guess); no RFC-1918 fallback (it made keying order-dependent). ARP-only wide subnets and global IPv6 are documented limitations. See `analysis/assets.rs`.
+- DNS/mDNS hostname evidence is trust-gated: answer records count only in responses (qr=1), and only when the record names the speaker itself or a host on the same learned local segment. A resolver's answers for off-segment IPs are not attributed — off-link assets get names from TLS SNI / HTTP Host instead.
 
 ## Where to learn the formats
 

@@ -321,6 +321,15 @@ inventory order-independent.
   the hostname. We *report* the degradation rather than pretending.
 - **Service evidence is graded** (`SynAck` > `AppLayer` > `PortHeuristic`) so a
   guess is never presented as a fact.
+- **DNS/mDNS naming evidence is trust-gated** — answer records count only in
+  responses (qr=1; answers riding on queries are a poisoning shape or mDNS
+  known-answer suppression, neither a claim), and only when the record names
+  the speaker itself or a neighbor on the same learned local segment
+  (resolver-style). A spoofed record claiming an off-segment victim IP cannot
+  rewrite that asset's identity; off-link hosts are named by TLS SNI / HTTP
+  Host instead. The residual exposure — an on-segment attacker naming an
+  on-segment neighbor — is indistinguishable from a legitimate local resolver
+  by passive evidence alone.
 - **Offload-capture quirks are handled, not punted**: IPv4 `total_length == 0`
   and IPv6 `payload_length == 0` (TSO/GSO captures taken on the sending host,
   plus v6 jumbograms) decode using the captured bytes instead of being dropped

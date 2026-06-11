@@ -210,6 +210,41 @@ fn normal_traffic_never_triggers_caps() {
     assert!(!assets.overflow().any());
 }
 
+/// One MAC spraying fresh IPv6 link-local *sources* — local by definition,
+/// with no subnet learning and no ARP/DHCP needed — must not grow its single
+/// asset's IP set with the streamed file. `max_bindings` does not bound this
+/// path: `record_local_host` runs even when `bind()` dropped at its cap, so
+/// the per-asset `max_ips_per_asset` cap has to hold on its own.
+#[test]
+fn ipv6_link_local_source_flood_respects_per_asset_ip_cap() {
+    let mut assets = AssetInventory::with_limits(Limits::tiny()); // max_ips_per_asset = 4
+    let mac = MacAddr([2, 0, 0, 0, 0, 0x66]);
+    for i in 0u16..200 {
+        let frame = Packet::ethernet(mac, MacAddr([0x33, 0x33, 0, 0, 0, 1]))
+            .ipv6(
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, i),
+                Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1),
+            )
+            .udp(40000, 40001)
+            .payload(b"x");
+        decode_observe(&mut assets, &frame);
+    }
+    let asset = assets
+        .assets()
+        .into_iter()
+        .find(|a| a.macs.contains(&mac))
+        .expect("flooded asset exists");
+    assert!(
+        asset.ips.len() <= 4,
+        "per-asset IP set must respect its cap, got {}",
+        asset.ips.len()
+    );
+    assert!(
+        assets.overflow().ips > 0,
+        "ip-cap drops must be counted, not silent"
+    );
+}
+
 /// An IPv6 random-flow flood must also stay bounded (the v6 path is separate).
 #[test]
 fn ipv6_flow_flood_respects_cap() {

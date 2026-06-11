@@ -141,12 +141,22 @@ impl Asset {
     /// Identity-preserving: keeps this asset's `key`, takes the union of
     /// addresses, the strongest hostname source, and the strongest service
     /// evidence; widens the first/last-seen window. Returns how many
-    /// (hostnames, services) the per-asset caps dropped, so promotion-time
-    /// overflow is counted like any other.
-    fn merge_from(&mut self, other: Self, cap_hostnames: usize, cap_services: usize) -> (u64, u64) {
-        let (mut dropped_names, mut dropped_services) = (0u64, 0u64);
+    /// (hostnames, services, ips) the per-asset caps dropped, so
+    /// promotion-time overflow is counted like any other.
+    fn merge_from(
+        &mut self,
+        other: Self,
+        cap_hostnames: usize,
+        cap_services: usize,
+        cap_ips: usize,
+    ) -> (u64, u64, u64) {
+        let (mut dropped_names, mut dropped_services, mut dropped_ips) = (0u64, 0u64, 0u64);
         self.macs.extend(other.macs);
-        self.ips.extend(other.ips);
+        for ip in other.ips {
+            if self.add_ip(ip, cap_ips) {
+                dropped_ips = dropped_ips.saturating_add(1);
+            }
+        }
         for (name, source) in other.hostnames {
             if self.add_hostname(name, source, cap_hostnames) {
                 dropped_names = dropped_names.saturating_add(1);
@@ -161,7 +171,7 @@ impl Asset {
         self.vendor_class = self.vendor_class.take().or(other.vendor_class);
         self.first_seen = self.first_seen.min(other.first_seen);
         self.last_seen = self.last_seen.max(other.last_seen);
-        (dropped_names, dropped_services)
+        (dropped_names, dropped_services, dropped_ips)
     }
 
     /// Services as the public `Service` view, sorted by port then proto.
@@ -231,6 +241,22 @@ impl Asset {
         self.services.insert((port, proto), evidence);
         false
     }
+
+    /// Returns `true` if a *new* IP was dropped at the per-asset cap. One MAC
+    /// spraying fresh IPv6 link-local sources — local by definition, no
+    /// subnet learning needed — would otherwise grow this one set with the
+    /// streamed file; `max_bindings` does not bound it because
+    /// `record_local_host` runs even when `bind()` dropped at its cap.
+    fn add_ip(&mut self, ip: IpAddr, cap: usize) -> bool {
+        if self.ips.contains(&ip) {
+            return false;
+        }
+        if self.ips.len() >= cap {
+            return true;
+        }
+        self.ips.insert(ip);
+        false
+    }
 }
 
 /// Tallies of what hostile floods forced us to drop — surfaced in reports so
@@ -242,6 +268,8 @@ pub struct AssetOverflow {
     pub subnets: u64,
     pub hostnames: u64,
     pub services: u64,
+    /// IPs dropped at the per-asset `max_ips_per_asset` cap.
+    pub ips: u64,
     /// IPs whose MAC binding changed mid-capture (DHCP churn, VRRP failover,
     /// spoofing) — flow attribution for these resolves through the *final*
     /// binding and is therefore ambiguous.
@@ -251,7 +279,7 @@ pub struct AssetOverflow {
 impl AssetOverflow {
     #[must_use]
     pub fn any(&self) -> bool {
-        self.assets | self.bindings | self.subnets | self.hostnames | self.services != 0
+        self.assets | self.bindings | self.subnets | self.hostnames | self.services | self.ips != 0
     }
 }
 
@@ -511,20 +539,24 @@ impl AssetInventory {
             return;
         };
         let ts = orphan.first_seen;
-        let (ch, cs) = (
+        let (ch, cs, ci) = (
             self.limits.max_hostnames_per_asset,
             self.limits.max_services_per_asset,
+            self.limits.max_ips_per_asset,
         );
         // `asset_mut` may return None only at the asset cap; since we just
         // removed one, there is room for the MAC-keyed target.
-        let mut dropped = (0u64, 0u64);
+        let mut dropped = (0u64, 0u64, 0u64);
         if let Some(target) = self.asset_mut(AssetKey::Mac(mac), ts) {
-            dropped = target.merge_from(orphan, ch, cs);
+            dropped = target.merge_from(orphan, ch, cs, ci);
             target.macs.insert(mac);
-            target.ips.insert(ip);
+            if target.add_ip(ip, ci) {
+                dropped.2 = dropped.2.saturating_add(1);
+            }
         }
         self.overflow.hostnames = self.overflow.hostnames.saturating_add(dropped.0);
         self.overflow.services = self.overflow.services.saturating_add(dropped.1);
+        self.overflow.ips = self.overflow.ips.saturating_add(dropped.2);
     }
 
     /// Is this IP plausibly on the local L2 segment? See the type docs. The
@@ -552,6 +584,25 @@ impl AssetInventory {
         }
     }
 
+    /// Do these two IPs sit on one *learned* local segment? This is the trust
+    /// bound for resolver-style DNS answers: a local DNS server may name its
+    /// same-segment neighbors, but never an off-link IP. IPv4 requires a
+    /// shared learned subnet (DHCP option 1 or the ARP /24 guess); IPv6 reuses
+    /// the [`AssetInventory::is_local`] rule — link-local/ULA addresses seen
+    /// in one single-link capture share that link.
+    fn same_local_segment(&self, a: IpAddr, b: IpAddr) -> bool {
+        match (a, b) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                let (a, b) = (u32::from(a), u32::from(b));
+                self.local_v4_subnets
+                    .iter()
+                    .any(|(&mask, nets)| a & mask == b & mask && nets.contains(&(a & mask)))
+            }
+            (IpAddr::V6(_), IpAddr::V6(_)) => self.is_local(a) && self.is_local(b),
+            _ => false,
+        }
+    }
+
     /// Get or create an asset. Returns `None` when the inventory is at
     /// `max_assets` and this is a new identity — a random-source-IP flood then
     /// stops creating assets (counted) instead of exhausting memory.
@@ -571,14 +622,18 @@ impl AssetInventory {
         if mac == MacAddr::BROADCAST || mac.is_multicast() || mac == MacAddr::ZERO {
             return;
         }
+        let cap = self.limits.max_ips_per_asset;
         let Some(asset) = self.asset_mut(AssetKey::Mac(mac), ts) else {
             return;
         };
         asset.macs.insert(mac);
         asset.last_seen = asset.last_seen.max(ts);
         asset.first_seen = asset.first_seen.min(ts);
-        if let Some(ip) = ip.filter(|ip| !ip.is_unspecified() && !ip.is_multicast()) {
-            asset.ips.insert(ip);
+        let dropped = ip
+            .filter(|ip| !ip.is_unspecified() && !ip.is_multicast())
+            .is_some_and(|ip| asset.add_ip(ip, cap));
+        if dropped {
+            self.overflow.ips = self.overflow.ips.saturating_add(1);
         }
     }
 
@@ -648,16 +703,45 @@ impl AssetInventory {
                 }
             }
             AppEvent::Dns(dns) => {
-                // A/AAAA answers name the *server* IP; attribute to its asset.
+                // A/AAAA answers are unauthenticated bytes naming a *claimed*
+                // IP. Two gates before any inventory write. First: only
+                // responses carry naming evidence — answer records riding on
+                // a query (qr=0) are either a poisoning attempt or mDNS
+                // known-answer suppression (the querier's cache, not a
+                // claim). Second: trust a host to name *itself* (mDNS
+                // announces, the normal case), or — resolver-style — a
+                // neighbor on the same learned local segment; a record
+                // claiming an off-segment IP would let any spoofed datagram
+                // rewrite an arbitrary victim's reported identity.
+                if !dns.is_response {
+                    return;
+                }
+                let Some((src, _)) = pkt.ip_pair() else {
+                    return;
+                };
                 for answer in &dns.answers {
                     let (ip, source) = match &answer.data {
                         DnsRData::A(ip) => (IpAddr::V4(*ip), source_for(dns.is_mdns)),
                         DnsRData::Aaaa(ip) => (IpAddr::V6(*ip), source_for(dns.is_mdns)),
                         _ => continue,
                     };
+                    // is_unicast on both sides: a claimed broadcast address
+                    // falls inside its segment's learned subnet, and a
+                    // multicast "host" is not an asset.
+                    if !is_unicast(ip) || !is_unicast(src) {
+                        continue;
+                    }
+                    if ip != src && !self.same_local_segment(src, ip) {
+                        continue;
+                    }
+                    let cap = self.limits.max_ips_per_asset;
                     let key = self.key_for_ip(ip);
-                    if let Some(asset) = self.asset_mut(key, ts) {
-                        asset.ips.insert(ip);
+                    let dropped = match self.asset_mut(key, ts) {
+                        Some(asset) => asset.add_ip(ip, cap),
+                        None => false, // asset-cap drop already counted
+                    };
+                    if dropped {
+                        self.overflow.ips = self.overflow.ips.saturating_add(1);
                     }
                     self.attribute_hostname(key, answer.name.clone(), source, ts);
                 }
@@ -1041,6 +1125,144 @@ mod tests {
         };
         let app = crate::app::sniff(&pkt);
         inv.observe(&pkt, app.as_ref());
+    }
+
+    /// A DNS *query* (qr=0) that smuggles an A answer — the wire shape of a
+    /// poisoning attempt (or mDNS known-answer suppression, which is the
+    /// querier's cache, not a claim).
+    fn dns_query_with_answer(name: &str, addr: Ipv4Addr) -> Vec<u8> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0x4242u16.to_be_bytes()); // id
+        msg.extend_from_slice(&[0x00, 0x00]); // qr=0: a query...
+        msg.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]); // ...carrying 1 answer
+        msg.extend_from_slice(&crate::fixtures::dns_name(name));
+        msg.extend_from_slice(&[0, 1, 0, 1]); // A, IN
+        msg.extend_from_slice(&60u32.to_be_bytes()); // ttl
+        msg.extend_from_slice(&[0, 4]);
+        msg.extend_from_slice(&addr.octets());
+        msg
+    }
+
+    fn any_hostname(inv: &AssetInventory, name: &str) -> bool {
+        inv.assets()
+            .iter()
+            .any(|a| a.hostnames.keys().any(|h| h == name))
+    }
+
+    #[test]
+    fn dns_answers_riding_on_queries_attribute_nothing() {
+        // Attacker and victim share a learned segment, so only the qr gate
+        // stands between the smuggled record and the inventory.
+        let mut inv = AssetInventory::new();
+        inv.bind_authoritative(MacAddr([2, 0, 0, 0, 0, 1]), v4(10, 0, 0, 66));
+        let frame = crate::fixtures::Packet::ethernet(
+            MacAddr([2, 0, 0, 0, 0, 1]),
+            MacAddr([0x01, 0, 0x5E, 0, 0, 0xFB]),
+        )
+        .ipv4(Ipv4Addr::new(10, 0, 0, 66), Ipv4Addr::new(224, 0, 0, 251))
+        .udp(5353, 5353)
+        .payload(&dns_query_with_answer(
+            "evil.local",
+            Ipv4Addr::new(10, 0, 0, 9),
+        ));
+        observe_frame(&mut inv, &frame);
+        assert!(
+            !any_hostname(&inv, "evil.local"),
+            "a query carrying answer records must attribute nothing"
+        );
+    }
+
+    #[test]
+    fn dns_answer_naming_off_segment_ip_is_not_attributed() {
+        // ARP teaches 192.168.1.0/24; the on-segment attacker then "responds"
+        // with `evil.example IN A <off-segment victim>`. The claimed IP is
+        // neither the speaker nor on a learned segment: no attribution, and
+        // the forged record must not even create the victim's asset.
+        let mut inv = AssetInventory::new();
+        let attacker = MacAddr([2, 0, 0, 0, 0, 0x66]);
+        let victim_ip = v4(93, 184, 216, 34);
+        let arp = crate::fixtures::Packet::ethernet(attacker, MacAddr::BROADCAST).arp_reply(
+            Ipv4Addr::new(192, 168, 1, 66),
+            MacAddr([2, 0, 0, 0, 0, 2]),
+            Ipv4Addr::new(192, 168, 1, 9),
+        );
+        observe_frame(&mut inv, &arp);
+        let frame = crate::fixtures::Packet::ethernet(attacker, MacAddr([2, 0, 0, 0, 0, 2]))
+            .ipv4(
+                Ipv4Addr::new(192, 168, 1, 66),
+                Ipv4Addr::new(192, 168, 1, 9),
+            )
+            .udp(53, 51000)
+            .payload(&crate::fixtures::dns_response_a(
+                7,
+                "evil.example",
+                Ipv4Addr::new(93, 184, 216, 34),
+            ));
+        observe_frame(&mut inv, &frame);
+        assert!(
+            !any_hostname(&inv, "evil.example"),
+            "an off-segment claim must not name the victim"
+        );
+        assert!(
+            inv.assets()
+                .iter()
+                .all(|a| a.key != AssetKey::Ip(victim_ip)),
+            "a forged record must not create the victim's asset"
+        );
+    }
+
+    #[test]
+    fn mdns_self_announcement_still_attributes() {
+        // The normal mDNS case: a host announces its own A record. Source IP
+        // equals the claimed IP, so this passes with no segment learned at
+        // all — keeping attribution order-independent for self-claims.
+        let mut inv = AssetInventory::new();
+        let phone = MacAddr([0xD0, 0x81, 0x7A, 0, 0, 7]);
+        let ip = Ipv4Addr::new(192, 168, 1, 77);
+        let frame = crate::fixtures::Packet::ethernet(phone, MacAddr([0x01, 0, 0x5E, 0, 0, 0xFB]))
+            .ipv4(ip, Ipv4Addr::new(224, 0, 0, 251))
+            .udp(5353, 5353)
+            .payload(&crate::fixtures::mdns_announce_a("franks-iphone.local", ip));
+        observe_frame(&mut inv, &frame);
+        let asset = inv
+            .assets()
+            .into_iter()
+            .find(|a| a.ips.contains(&IpAddr::V4(ip)))
+            .unwrap_or_else(|| unreachable!("self-announced asset must exist"));
+        assert!(
+            asset.hostnames.keys().any(|h| h == "franks-iphone.local"),
+            "a self-announcement must still attribute"
+        );
+    }
+
+    #[test]
+    fn local_resolver_may_name_same_segment_neighbors() {
+        // Resolver-style cross-host naming is kept *within* a learned
+        // segment: the gateway's DNS answers `printer.lan IN A 192.168.1.30`
+        // and the printer's asset gets the name.
+        let mut inv = AssetInventory::new();
+        inv.bind_authoritative(MacAddr([0xAA, 0, 0xCC, 0, 0, 1]), v4(192, 168, 1, 1));
+        let frame = crate::fixtures::Packet::ethernet(
+            MacAddr([0xAA, 0, 0xCC, 0, 0, 1]),
+            MacAddr([0x3C, 0, 0, 0, 0, 1]),
+        )
+        .ipv4(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 10),
+        )
+        .udp(53, 51000)
+        .payload(&crate::fixtures::dns_response_a(
+            9,
+            "printer.lan",
+            Ipv4Addr::new(192, 168, 1, 30),
+        ));
+        observe_frame(&mut inv, &frame);
+        let printer = inv
+            .assets()
+            .into_iter()
+            .find(|a| a.ips.contains(&v4(192, 168, 1, 30)))
+            .unwrap_or_else(|| unreachable!("printer asset must exist"));
+        assert!(printer.hostnames.keys().any(|h| h == "printer.lan"));
     }
 
     #[test]

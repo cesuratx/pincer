@@ -44,6 +44,7 @@ pub struct Limits {
     pub max_subnets: usize,
     pub max_hostnames_per_asset: usize,
     pub max_services_per_asset: usize,
+    pub max_ips_per_asset: usize,
     pub max_dns_records: usize,
     pub max_dhcp_records: usize,
 }
@@ -57,6 +58,11 @@ impl Default for Limits {
             max_subnets: 4_096,
             max_hostnames_per_asset: 256,
             max_services_per_asset: 1_024,
+            // Generous for real multi-homed hosts and routers; small enough
+            // that one MAC spraying fresh IPv6 link-local sources (which are
+            // local by definition, no subnet learning needed) cannot grow a
+            // single asset's IP set with the streamed file.
+            max_ips_per_asset: 4_096,
             max_dns_records: 2_000_000,
             max_dhcp_records: 1_000_000,
         }
@@ -74,6 +80,7 @@ impl Limits {
             max_subnets: 4,
             max_hostnames_per_asset: 4,
             max_services_per_asset: 4,
+            max_ips_per_asset: 4,
             max_dns_records: 8,
             max_dhcp_records: 8,
         }

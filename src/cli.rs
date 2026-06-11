@@ -316,8 +316,8 @@ impl Pass {
         if of.any() {
             warn(format!(
                 "asset caps reached (dropped: {} assets, {} bindings, {} subnets, \
-                 {} hostnames, {} services)",
-                of.assets, of.bindings, of.subnets, of.hostnames, of.services
+                 {} hostnames, {} services, {} ips)",
+                of.assets, of.bindings, of.subnets, of.hostnames, of.services, of.ips
             ));
         }
         if self.dns_dropped > 0 || self.dhcp_dropped > 0 {
@@ -350,6 +350,7 @@ impl Pass {
             subnets_dropped: of.subnets,
             hostnames_dropped: of.hostnames,
             services_dropped: of.services,
+            ips_dropped: of.ips,
             dns_records_dropped: self.dns_dropped,
             dhcp_records_dropped: self.dhcp_dropped,
             ips_rebound: of.rebound_ips,

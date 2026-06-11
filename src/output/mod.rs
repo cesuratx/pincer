@@ -121,6 +121,8 @@ pub struct Degradation {
     pub subnets_dropped: u64,
     pub hostnames_dropped: u64,
     pub services_dropped: u64,
+    /// IPs dropped at the per-asset `max_ips_per_asset` cap.
+    pub ips_dropped: u64,
     pub dns_records_dropped: u64,
     pub dhcp_records_dropped: u64,
     /// IPs whose MAC binding changed mid-capture — flow attribution for them

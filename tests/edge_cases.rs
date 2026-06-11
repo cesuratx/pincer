@@ -30,19 +30,21 @@ fn observe_frame(inv: &mut AssetInventory, ts: u64, frame: &[u8]) {
     }
 }
 
-/// A local host can be named (via a DNS/mDNS answer pointing at its IP) *before*
-/// we learn its MAC via ARP. The hostname must still end up on the host's final
+/// A local host can name itself (via its own mDNS announcement) *before* we
+/// learn its MAC via ARP. The hostname must still end up on the host's final
 /// (MAC-keyed) asset — not orphaned on a separate IP-keyed asset. This is the
-/// order-independence the asset model promises.
+/// order-independence the asset model promises. (The announcement is a
+/// self-claim — src IP == claimed IP — because third-party answers are only
+/// trusted within a learned segment; see assets.rs.)
 #[test]
 fn hostname_before_arp_binding_is_not_orphaned() {
     let server_ip = Ipv4Addr::new(192, 168, 1, 50);
     let server_mac = MacAddr([0xDC, 0xA6, 0x32, 0, 0, 1]);
     let gateway = MacAddr([0xAA, 0, 0xCC, 0, 0, 1]);
 
-    // 1) An mDNS answer names 192.168.1.50 = "fileserver.local" — seen first.
-    let mdns = Packet::ethernet(gateway, MacAddr([0x01, 0, 0x5E, 0, 0, 0xFB]))
-        .ipv4(Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(224, 0, 0, 251))
+    // 1) The server announces itself: 192.168.1.50 = "fileserver.local".
+    let mdns = Packet::ethernet(server_mac, MacAddr([0x01, 0, 0x5E, 0, 0, 0xFB]))
+        .ipv4(server_ip, Ipv4Addr::new(224, 0, 0, 251))
         .udp(5353, 5353)
         .payload(&fixtures::mdns_announce_a("fileserver.local", server_ip));
 
