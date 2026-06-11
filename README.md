@@ -120,7 +120,9 @@ smallest keys of the capture in any arrival order. The `dns`/`dhcp` detail
 logs are chronological instead: at their cap the first N records are kept
 and the rest counted as dropped. Once any cap engages, the overflow-counter
 values tally capped events and may vary with packet order (`flows_dropped`
-is exact; zero vs nonzero is always stable), so byte-diffing capped reports
+is exact; whether the run degraded at all is always stable, but an individual
+counter can even flip zero/nonzero when an evicted asset carried its own
+capped hostname/service/IP sets), so byte-diffing capped reports
 should exclude or normalize those counters — see DESIGN.md for the
 residuals. Anything that
 degrades a run — a truncated tail, a corrupt mid-stream section header
