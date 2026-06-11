@@ -172,10 +172,12 @@ constraint. Here's each one in `pincer` with the specific problem it solves.
 shorter than 13 bytes — and we have hundreds of such reads. With raw indexing
 spread across the codebase, "never panics" is unprovable.
 
-**Solution:** one type, [`bytes::Cursor`](src/bytes.rs), is the *only* code
-allowed to read raw bytes. Every accessor is bounds-checked and returns
-`Result`. Everywhere else, the lint `clippy::indexing_slicing` is **denied**, so
-the compiler rejects any `bytes[i]` outside `Cursor`. Now "never panics" reduces
+**Solution:** one type, [`bytes::Cursor`](src/bytes.rs), is the only code
+that *indexes or slices* raw packet bytes. Every accessor is bounds-checked and
+returns `Result`. Everywhere else, the lint `clippy::indexing_slicing` is
+**denied**, so the compiler rejects any `bytes[i]` outside `Cursor`. (A few
+consumers — the HTTP sniffer's header scan, for example — then read those bytes
+through safe std APIs like `str::from_utf8`, which cannot panic either.) Now "never panics" reduces
 to "audit one small file," and we did — then proved it empirically with a fuzz
 test. This is the keystone: most other safety properties rest on it.
 
@@ -303,11 +305,12 @@ in the per-packet hot path allocates nothing. This is exactly the kind of domain
 subtlety a passive-discovery product lives and dies on.
 
 Residual limitations, stated honestly in the code: an ARP-only network wider
-than /24 may IP-key a same-segment host in another /24; single-pass ordering
-means a segment learned mid-capture doesn't retroactively re-key earlier
-packets; IPv6 locality covers link-local/ULA only (global SLAAC needs NDP
-parsing we don't do). The deeper fix is a two-phase resolve (collect, then key
-once with the complete segment set) — noted as future work, not pretended away.
+than /24 may IP-key a same-segment host in another /24; IPv6 locality covers
+link-local/ULA only (global SLAAC needs NDP parsing we don't do). The deeper
+fix — a two-phase resolve that collects candidate bindings during the pass and
+keys them once at the end, against the complete segment set — is implemented:
+`record_provisional` collects, `finalize()` resolves, which is what makes the
+inventory order-independent.
 
 ### Honest limitations, stated not hidden
 

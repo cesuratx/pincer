@@ -18,7 +18,10 @@ cargo run -- summary testdata/office.pcap     # try a subcommand
 ```
 
 Subcommands: `summary`, `flows`, `assets`, `services`, `deps` (`--dot` for
-Graphviz), `dns`, `dhcp`, `gen`. Every analysis subcommand accepts `--json`.
+Graphviz), `dns`, `dhcp`, `gen`. Every analysis subcommand accepts `--json`,
+and `-` as the file argument streams from stdin (`gzcat big.pcap.gz | pincer
+flows -`). Hostile-flood caps live in `analysis::Limits`; cap drops and other
+degradation are reported on stderr and in the JSON envelope.
 
 ## Definition of done
 
@@ -38,8 +41,8 @@ sync (a test enforces byte-identity).
 - `pcap/` — streaming `CaptureReader` (legacy + pcapng) and a legacy `writer`. Lending iterator: one reusable buffer, constant memory on any file size.
 - `decode/` — zero-copy layer views: Ethernet/VLAN, ARP, IPv4, IPv6, TCP, UDP, ICMP. Borrow the buffer; allocate nothing.
 - `app/` — best-effort sniffers returning **owned** `AppEvent`: DNS/mDNS, DHCP, HTTP, TLS SNI. This owned/borrowed boundary is deliberate.
-- `analysis/` — `Observe` sinks run in a single pass: `flows`, `assets`, `deps`, `stats`.
-- `output/` — table / JSON / DOT renderers behind one `Report` type.
+- `analysis/` — `Observe` sinks run in a single pass: `flows`, `assets`, `stats`; `deps` is *derived* from flows + assets after the pass.
+- `output/` — table / JSON renderers behind one `Report` type, plus the standalone DOT renderer (`deps_dot`).
 - `fixtures/` — typestate packet builder + `scenarios` (office, incident). Powers tests and `gen`.
 
 ## House rules (enforced by lints — do not work around them)

@@ -54,3 +54,15 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 Built to explore how passive network sensors turn raw traffic into asset
 intelligence — communication flows, an asset inventory, and a dependency map.
+
+## Streaming, limits, and degradation
+
+Pass `-` as the capture argument to stream from stdin — no local disk needed:
+`ssh host 'cat big.pcap' | pincer flows -` or `gzcat big.pcap.gz | pincer deps -`.
+Memory stays constant either way.
+
+Analysis collections are hard-capped (`analysis::Limits`) so a hostile capture
+degrades instead of exhausting memory. Anything that degrades a run — a
+truncated tail, malformed blocks skipped, caps hit — is reported as warnings on
+stderr and machine-readably in the `degradation` object of every `--json`
+envelope.
