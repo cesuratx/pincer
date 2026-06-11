@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned: a floating "stable" gives non-reproducible builds and surprise lint
+# breakage when clippy adds lints. Bump deliberately.
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]

@@ -67,7 +67,9 @@ pub enum TransportView<'a> {
 /// One decoded packet. All slices borrow the capture buffer.
 #[derive(Debug)]
 pub struct PacketView<'a> {
-    pub ts: Timestamp,
+    /// Capture time; `None` when the container carried no per-record
+    /// timestamp (pcapng Simple Packet Blocks). Sinks must skip, not invent.
+    pub ts: Option<Timestamp>,
     /// Length on the wire (used for byte accounting).
     pub orig_len: u32,
     /// Bytes actually captured.
@@ -109,6 +111,8 @@ pub fn decode_packet<'a>(record: &Record<'a>) -> Result<PacketView<'a>, DecodeEr
             return Err(DecodeError::malformed("link", "unsupported link type"));
         }
     };
+    // Lossless: both readers cap record bodies at MAX_RECORD_LEN (64 MiB),
+    // far below u32::MAX.
     #[allow(clippy::cast_possible_truncation)]
     let cap_len = record.data.len() as u32;
     let mut truncated = cap_len < record.orig_len;
@@ -116,6 +120,14 @@ pub fn decode_packet<'a>(record: &Record<'a>) -> Result<PacketView<'a>, DecodeEr
     let net = match eth.ethertype {
         ethernet::ETHERTYPE_ARP => match arp::parse(&mut cur) {
             Ok(view) => NetView::Arp(view),
+            // Spec-valid ARP we simply do not decode must not inflate the
+            // malformed (lying-packet) anomaly counter.
+            Err(DecodeError::Malformed {
+                reason: "unsupported hardware/protocol",
+                ..
+            }) => NetView::Unknown {
+                ethertype: ethernet::ETHERTYPE_ARP,
+            },
             Err(err) => NetView::Malformed { layer: "arp", err },
         },
         ethernet::ETHERTYPE_IPV4 => match ipv4::parse(&mut cur) {
@@ -137,7 +149,7 @@ pub fn decode_packet<'a>(record: &Record<'a>) -> Result<PacketView<'a>, DecodeEr
                 // parse TCP at fragment offset N is the classic trap.
                 None
             } else {
-                Some(parse_transport(ip.proto, ip.payload, false))
+                Some(parse_transport(ip.proto, ip.payload))
             }
         }
         NetView::Ipv6(ip) => {
@@ -147,7 +159,7 @@ pub fn decode_packet<'a>(record: &Record<'a>) -> Result<PacketView<'a>, DecodeEr
                 // middle of a datagram, not a transport header.
                 None
             } else {
-                Some(parse_transport(ip.next_header, ip.payload, true))
+                Some(parse_transport(ip.next_header, ip.payload))
             }
         }
         _ => None,
@@ -156,16 +168,25 @@ pub fn decode_packet<'a>(record: &Record<'a>) -> Result<PacketView<'a>, DecodeEr
     // A transport whose length field promised more than was captured is also a
     // truncation — propagate it the same way the IP layers do, so snaplen-cut
     // UDP payloads (DNS/DHCP/NTP) are counted as anomalies, not clean packets.
-    if let Some(TransportView::Udp(udp)) = &transport {
+    // EXCEPT the first fragment of a fragmented datagram: there the UDP length
+    // describes the whole datagram by design, and the missing bytes live in
+    // the other fragments, not on the cutting-room floor.
+    let first_fragment = match &net {
+        NetView::Ipv4(ip) => ip.is_fragmented() && !ip.is_fragment_continuation(),
+        NetView::Ipv6(ip) => ip.fragmented && !ip.is_fragment_continuation(),
+        _ => false,
+    };
+    if !first_fragment && let Some(TransportView::Udp(udp)) = &transport {
         truncated |= udp.payload_truncated;
     }
 
     Ok(PacketView {
         ts: record.ts,
-        // The on-wire length as recorded; byte accounting uses this. We do not
-        // inflate it to cap_len — readers now guarantee data.len() <= orig_len,
-        // so a captured length below orig_len is a genuine truncation, not a
-        // value to paper over.
+        // The on-wire length as recorded; byte accounting uses this. The
+        // readers normalize orig_len to at least the captured length (a
+        // record claiming orig_len < incl_len is a writer lie), so a captured
+        // length below orig_len is a genuine truncation, not a value to paper
+        // over.
         orig_len: record.orig_len,
         cap_len,
         eth,
@@ -175,7 +196,7 @@ pub fn decode_packet<'a>(record: &Record<'a>) -> Result<PacketView<'a>, DecodeEr
     })
 }
 
-fn parse_transport(proto: u8, payload: &[u8], v6: bool) -> TransportView<'_> {
+fn parse_transport(proto: u8, payload: &[u8]) -> TransportView<'_> {
     let mut cur = Cursor::new(payload);
     match proto {
         6 => match tcp::parse(&mut cur) {
@@ -190,7 +211,9 @@ fn parse_transport(proto: u8, payload: &[u8], v6: bool) -> TransportView<'_> {
             Ok(view) => TransportView::Sctp(view),
             Err(err) => TransportView::Malformed { layer: "sctp", err },
         },
-        1 | 58 => match icmp::parse(&mut cur, v6) {
+        // ICMP flavor follows the IP *protocol number*, not the outer IP
+        // version — ICMPv4 tunneled in IPv6 keeps v4 type/code semantics.
+        1 | 58 => match icmp::parse(&mut cur, proto == 58) {
             Ok(view) => TransportView::Icmp(view),
             Err(err) => TransportView::Malformed { layer: "icmp", err },
         },

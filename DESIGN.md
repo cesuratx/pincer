@@ -133,7 +133,14 @@ has **three tiers** ([error.rs](src/error.rs)):
 
 1. **`PcapError` — the container is broken.** Bad magic number, an impossible
    block length, the file ends mid-header. This is fatal *to the stream*: we
-   can't trust the file's framing, so we stop. Returned by the reader.
+   can't trust the file's framing past that point, so we stop reading.
+   Returned by the reader. Fatal to the stream is not fatal to the *run*: the
+   CLI turns mid-stream damage — a truncated tail, a framing mismatch, a
+   corrupt later section header in a concatenated pcapng — into a flagged
+   partial report (`truncated_tail` / `damaged_section` in the degradation
+   envelope, plus a stderr warning) and keeps everything already analyzed.
+   Only an unreadable *initial* header, where nothing trustworthy has been
+   parsed yet, aborts with an error.
 
 2. **`DecodeError` — one packet is bad.** Truncated (ran out of bytes — normal,
    from snaplen) or malformed (claims to be IPv4 but isn't). This is **not**
@@ -172,10 +179,12 @@ constraint. Here's each one in `pincer` with the specific problem it solves.
 shorter than 13 bytes — and we have hundreds of such reads. With raw indexing
 spread across the codebase, "never panics" is unprovable.
 
-**Solution:** one type, [`bytes::Cursor`](src/bytes.rs), is the *only* code
-allowed to read raw bytes. Every accessor is bounds-checked and returns
-`Result`. Everywhere else, the lint `clippy::indexing_slicing` is **denied**, so
-the compiler rejects any `bytes[i]` outside `Cursor`. Now "never panics" reduces
+**Solution:** one type, [`bytes::Cursor`](src/bytes.rs), is the only code
+that *indexes or slices* raw packet bytes. Every accessor is bounds-checked and
+returns `Result`. Everywhere else, the lint `clippy::indexing_slicing` is
+**denied**, so the compiler rejects any `bytes[i]` outside `Cursor`. (A few
+consumers — the HTTP sniffer's header scan, for example — then read those bytes
+through safe std APIs like `str::from_utf8`, which cannot panic either.) Now "never panics" reduces
 to "audit one small file," and we did — then proved it empirically with a fuzz
 test. This is the keystone: most other safety properties rest on it.
 
@@ -252,7 +261,16 @@ candidates in order, cheapest discriminator first, stopping at the first match.
 
 **Solution:** [`app::sniff`](src/app/mod.rs) tries sniffers in sequence; each
 does a cheap structural pre-check and returns `Option`, so `None` falls through
-to the next. UDP dispatches by port; TCP by content (`tls.or_else(|| http)`).
+to the next. UDP dispatches by port; TCP by content (`tls.or_else(|| http)` —
+HTTP itself gates on a method-prefix check before any payload scan, so bulk
+non-HTTP TCP rejects in O(8) bytes).
+
+The CLI threads a *depth hint* (`SniffDepth`) into the dispatch: `flows` and
+`summary` consume only the event label, so for them the DNS/DHCP sniffers run
+validation-only — the payload is walked with exactly the same bounds and caps
+(accept/reject, and therefore the label, cannot diverge; a property test pins
+this) but no query/answer/option detail is allocated. Sinks that read the
+detail (`assets`, `dns`, `dhcp`) keep the full parse.
 
 ### 5.7 Strategy (output rendering)
 
@@ -303,11 +321,12 @@ in the per-packet hot path allocates nothing. This is exactly the kind of domain
 subtlety a passive-discovery product lives and dies on.
 
 Residual limitations, stated honestly in the code: an ARP-only network wider
-than /24 may IP-key a same-segment host in another /24; single-pass ordering
-means a segment learned mid-capture doesn't retroactively re-key earlier
-packets; IPv6 locality covers link-local/ULA only (global SLAAC needs NDP
-parsing we don't do). The deeper fix is a two-phase resolve (collect, then key
-once with the complete segment set) — noted as future work, not pretended away.
+than /24 may IP-key a same-segment host in another /24; IPv6 locality covers
+link-local/ULA only (global SLAAC needs NDP parsing we don't do). The deeper
+fix — a two-phase resolve that collects candidate bindings during the pass and
+keys them once at the end, against the complete segment set — is implemented:
+`record_provisional` collects, `finalize()` resolves, which is what makes the
+inventory order-independent.
 
 ### Honest limitations, stated not hidden
 
@@ -318,6 +337,23 @@ once with the complete segment set) — noted as future work, not pretended away
   the hostname. We *report* the degradation rather than pretending.
 - **Service evidence is graded** (`SynAck` > `AppLayer` > `PortHeuristic`) so a
   guess is never presented as a fact.
+- **DNS/mDNS naming evidence is trust-gated** — answer records count only in
+  responses (qr=1; answers riding on queries are a poisoning shape or mDNS
+  known-answer suppression, neither a claim), and only when the record names
+  the speaker itself or a neighbor on the same learned local segment
+  (resolver-style). A spoofed record claiming an off-segment victim IP cannot
+  rewrite that asset's identity; off-link hosts are named by TLS SNI / HTTP
+  Host instead. The residual exposure — an on-segment attacker naming an
+  on-segment neighbor — is indistinguishable from a legitimate local resolver
+  by passive evidence alone.
+- **Timestamp absence is typed, not faked** — a pcapng Simple Packet Block
+  carries no timestamp, so `Record.ts` (and `PacketView.ts`) is
+  `Option<Timestamp>`. SPB records are excluded from every first/last fold and
+  from `duration_secs` (no fabricated 1970 epoch in flows, assets, or the
+  summary), and counted as `timestampless_records` in the degradation
+  envelope, a summary note, and a stderr warning. A >5-year timestamp span —
+  now only producible by genuinely inconsistent capture clocks — surfaces as
+  `clock_inconsistent` in summary JSON, not just the table note.
 - **Offload-capture quirks are handled, not punted**: IPv4 `total_length == 0`
   and IPv6 `payload_length == 0` (TSO/GSO captures taken on the sending host,
   plus v6 jumbograms) decode using the captured bytes instead of being dropped

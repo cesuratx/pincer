@@ -20,6 +20,10 @@ dbg_macro = "deny"
 indexing_slicing = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
+# arithmetic_side_effects is denied per-module (parsing code) rather than
+# crate-wide: date/rendering math on already-clamped values would need dozens
+# of checked_* calls for no provable safety gain. New parsing modules must
+# carry the module-level deny.
 # pedantic lints we deliberately opt out of:
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"

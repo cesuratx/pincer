@@ -57,6 +57,11 @@ impl Timestamp {
 
     #[must_use]
     pub const fn new(secs: u64, nanos: u32) -> Self {
+        // Normalize: carry whole seconds out of `nanos`, so `nanos < 1e9` is
+        // a constructor-enforced invariant rather than an advisory one
+        // (`Display` and the pcap writer both rely on it).
+        let secs = secs.saturating_add((nanos / 1_000_000_000) as u64);
+        let nanos = nanos % 1_000_000_000;
         Self {
             secs: if secs > Self::MAX_SECS {
                 Self::MAX_SECS
@@ -64,6 +69,19 @@ impl Timestamp {
                 secs
             },
             nanos,
+        }
+    }
+
+    /// The earlier of two *optional* timestamps. An absent timestamp means
+    /// "no observation", so it must never win — unlike `Option`'s derived
+    /// `Ord`, where `None < Some(_)` would drag a min-fold to "absent".
+    /// (`Option::max` already ignores `None` for the matching last-seen fold.)
+    #[must_use]
+    pub fn min_opt(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, None) => x,
+            (None, y) => y,
         }
     }
 

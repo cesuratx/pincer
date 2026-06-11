@@ -1,5 +1,8 @@
 # pincer
 
+[![CI](https://github.com/cesuratx/pincer/actions/workflows/ci.yml/badge.svg)](https://github.com/cesuratx/pincer/actions/workflows/ci.yml)
+[![Security audit](https://github.com/cesuratx/pincer/actions/workflows/audit.yml/badge.svg)](https://github.com/cesuratx/pincer/actions/workflows/audit.yml)
+
 A hand-rolled pcap/pcapng analyzer in Rust for **passive asset discovery**: it
 turns a network capture into communication **flows**, an **asset inventory**,
 and an **application dependency map** — no libpcap, no packet-parsing crates.
@@ -54,3 +57,21 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 Built to explore how passive network sensors turn raw traffic into asset
 intelligence — communication flows, an asset inventory, and a dependency map.
+
+## Streaming, limits, and degradation
+
+Pass `-` as the capture argument to stream from stdin — no local disk needed:
+`ssh host 'cat big.pcap' | pincer flows -` or `gzcat big.pcap.gz | pincer deps -`.
+Memory stays constant either way.
+
+Analysis collections are hard-capped (`analysis::Limits`) so a hostile capture
+degrades instead of exhausting memory. Anything that degrades a run — a
+truncated tail, a corrupt mid-stream section header (concatenated pcapng),
+malformed blocks skipped, caps hit, records without timestamps (pcapng Simple
+Packet Blocks) — is reported as warnings on stderr and machine-readably in the
+`degradation` object of every `--json` envelope. Only a capture whose initial
+header is unreadable fails outright.
+Timestamp-less records are excluded from every first/last time and duration —
+time fields stay `null`/absent rather than reading as the 1970 epoch — and a
+capture whose timestamps span more than five years sets a `clock_inconsistent`
+flag in the summary JSON alongside the table note.

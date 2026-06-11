@@ -19,7 +19,7 @@ use pincer::types::{MacAddr, Timestamp};
 
 fn observe_frame(inv: &mut AssetInventory, ts: u64, frame: &[u8]) {
     let record = Record {
-        ts: Timestamp::new(ts, 0),
+        ts: Some(Timestamp::new(ts, 0)),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: frame,
@@ -30,19 +30,21 @@ fn observe_frame(inv: &mut AssetInventory, ts: u64, frame: &[u8]) {
     }
 }
 
-/// A local host can be named (via a DNS/mDNS answer pointing at its IP) *before*
-/// we learn its MAC via ARP. The hostname must still end up on the host's final
+/// A local host can name itself (via its own mDNS announcement) *before* we
+/// learn its MAC via ARP. The hostname must still end up on the host's final
 /// (MAC-keyed) asset — not orphaned on a separate IP-keyed asset. This is the
-/// order-independence the asset model promises.
+/// order-independence the asset model promises. (The announcement is a
+/// self-claim — src IP == claimed IP — because third-party answers are only
+/// trusted within a learned segment; see assets.rs.)
 #[test]
 fn hostname_before_arp_binding_is_not_orphaned() {
     let server_ip = Ipv4Addr::new(192, 168, 1, 50);
     let server_mac = MacAddr([0xDC, 0xA6, 0x32, 0, 0, 1]);
     let gateway = MacAddr([0xAA, 0, 0xCC, 0, 0, 1]);
 
-    // 1) An mDNS answer names 192.168.1.50 = "fileserver.local" — seen first.
-    let mdns = Packet::ethernet(gateway, MacAddr([0x01, 0, 0x5E, 0, 0, 0xFB]))
-        .ipv4(Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(224, 0, 0, 251))
+    // 1) The server announces itself: 192.168.1.50 = "fileserver.local".
+    let mdns = Packet::ethernet(server_mac, MacAddr([0x01, 0, 0x5E, 0, 0, 0xFB]))
+        .ipv4(server_ip, Ipv4Addr::new(224, 0, 0, 251))
         .udp(5353, 5353)
         .payload(&fixtures::mdns_announce_a("fileserver.local", server_ip));
 
@@ -82,7 +84,13 @@ fn hostname_before_arp_binding_is_not_orphaned() {
 fn asset_inventory_is_order_independent() {
     use pincer::fixtures::scenarios;
 
-    type AssetRow = (String, Vec<String>, Vec<(u16, String)>);
+    type AssetRow = (
+        String,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<(u16, String)>,
+    );
     let summarize = |frames: &[(Timestamp, Vec<u8>)]| -> Vec<AssetRow> {
         let mut inv = AssetInventory::new();
         for (i, (_, frame)) in frames.iter().enumerate() {
@@ -104,7 +112,13 @@ fn asset_inventory_is_order_independent() {
                     .map(|s| (s.port, format!("{:?}", s.evidence)))
                     .collect();
                 svcs.sort();
-                (a.key.to_string(), names, svcs)
+                // Identity fields too: a merge bug that scrambles which
+                // MACs/IPs belong to which asset must fail this fingerprint.
+                let mut ips: Vec<String> = a.ips.iter().map(ToString::to_string).collect();
+                ips.sort();
+                let mut macs: Vec<String> = a.macs.iter().map(ToString::to_string).collect();
+                macs.sort();
+                (a.key.to_string(), ips, macs, names, svcs)
             })
             .collect();
         rows.sort();
@@ -182,7 +196,7 @@ fn vlan_stack_at_and_beyond_cap() {
         .udp(1000, 2000)
         .payload(b"x");
     let record = Record {
-        ts: Timestamp::ZERO,
+        ts: Some(Timestamp::ZERO),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: &frame,
@@ -201,7 +215,7 @@ fn vlan_stack_at_and_beyond_cap() {
         .udp(1000, 2000)
         .payload(b"x");
     let record = Record {
-        ts: Timestamp::ZERO,
+        ts: Some(Timestamp::ZERO),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: &frame,
@@ -242,7 +256,7 @@ fn synthetic_vlan_and_ipv6_agree_with_etherparse() {
 
     for frame in &frames {
         let record = Record {
-            ts: Timestamp::ZERO,
+            ts: Some(Timestamp::ZERO),
             orig_len: u32::try_from(frame.len()).unwrap(),
             link_type: LinkType::Ethernet,
             data: frame,

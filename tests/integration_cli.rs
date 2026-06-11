@@ -34,6 +34,9 @@ fn analyze_office() -> (Stats, FlowTable, AssetInventory) {
         flows.observe(&pkt, app.as_ref());
         assets.observe(&pkt, app.as_ref());
     }
+    // The CLI always finalizes before reporting (provisional bindings resolve
+    // there); test the state that actually ships.
+    assets.finalize();
     (stats, flows, assets)
 }
 

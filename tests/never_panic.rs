@@ -9,7 +9,6 @@ use pincer::app::sniff;
 use pincer::decode::decode_packet;
 use pincer::fixtures::scenarios;
 use pincer::pcap::{CaptureReader, LinkType, Record};
-use pincer::types::Timestamp;
 use proptest::prelude::*;
 
 /// Drive arbitrary bytes through the whole pipeline; never panic.
@@ -38,10 +37,11 @@ fn run_pipeline(capture: &[u8]) {
     }
 }
 
-/// A single Ethernet frame decoded directly; never panic.
+/// A single Ethernet frame decoded directly; never panic. `ts: None` keeps
+/// the timestamp-less (SPB) record shape under fuzz too.
 fn decode_frame(frame: &[u8]) {
     let record = Record {
-        ts: Timestamp::ZERO,
+        ts: None,
         orig_len: u32::try_from(frame.len()).unwrap_or(u32::MAX),
         link_type: LinkType::Ethernet,
         data: frame,
@@ -64,6 +64,16 @@ proptest! {
         decode_frame(&frame);
     }
 
+    /// Same property, but past the magic check: a pcapng SHB type prefix puts
+    /// the fuzz inside the section/block parsing machinery instead of
+    /// stopping at magic rejection.
+    #[test]
+    fn arbitrary_pcapng_section_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        let mut file = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        file.extend_from_slice(&bytes);
+        run_pipeline(&file);
+    }
+
     /// Fuzz the application sniffers directly on arbitrary payloads — the
     /// loop-prone parsers (DNS name decompression, TLS/DHCP option walks) get
     /// their most direct adversarial exposure here, below the packet framing.
@@ -73,7 +83,10 @@ proptest! {
     ) {
         let _ = pincer::app::dns::parse(&payload, false);
         let _ = pincer::app::dns::parse(&payload, true);
+        let _ = pincer::app::dns::parse_shallow(&payload, false);
+        let _ = pincer::app::dns::parse_shallow(&payload, true);
         let _ = pincer::app::dhcp::parse(&payload);
+        let _ = pincer::app::dhcp::parse_shallow(&payload);
         let _ = pincer::app::http::parse_request(&payload);
         let _ = pincer::app::tls::parse_client_hello(&payload);
     }

@@ -67,7 +67,9 @@ A sequence of typed, length-prefixed blocks. Every block:
   captured length, original length, then the packet bytes (padded to 4).
   Assuming microseconds globally is the classic pcapng bug.
 - **SPB — Simple Packet Block** (`0x00000003`): original length then packet
-  bytes; no timestamp, no per-interface data.
+  bytes; no timestamp, no per-interface data. The reader surfaces that absence
+  (`Record.ts = None`, counted as `timestampless_records` degradation) rather
+  than fabricating an epoch time.
 
 ## Edge cases the reader handles
 
@@ -77,4 +79,8 @@ A sequence of typed, length-prefixed blocks. Every block:
 - The reader reports a final record cut off mid-file as `TruncatedFile`; the
   analysis driver tolerates that case and reports what it has, so a partial
   capture still yields results.
+- A corrupt *second* SHB in a concatenated file (bad byte-order magic or an
+  unknown major version) likewise stops the stream without discarding it: the
+  driver keeps the sections already read and flags `damaged_section`. The
+  first SHB getting the same damage is a hard error — nothing was readable.
 - Constant memory: one reusable buffer, so multi-GB files stream fine.

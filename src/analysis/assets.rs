@@ -6,13 +6,15 @@
 //! show why we believe each fact — the discipline of attributing every
 //! inference, which is what makes passive findings trustworthy.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 
 use serde::Serialize;
 
 use super::{Limits, Observe, is_service_port, service_name};
-use crate::app::{AppEvent, DnsRData};
+use crate::app::{AppEvent, DhcpMsgType, DnsRData};
+use crate::decode::arp::ArpOp;
 use crate::decode::{ArpView, NetView, PacketView, TransportView};
 use crate::types::{MacAddr, Timestamp};
 
@@ -29,12 +31,28 @@ pub enum NameSource {
 /// How we learned a service is present on a host.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum ServiceEvidence {
+    // NOTE: variant order IS evidence strength (Ord) — strongest first.
     /// SYN-ACK observed from this host:port — it is definitely listening.
     SynAck,
     /// Application banner seen (TLS SNI, HTTP Host) — strong evidence.
     AppLayer,
+    /// A UDP datagram from this host:port answered an ephemeral port — a
+    /// listener responded (UDP's closest analogue to a SYN-ACK).
+    UdpResponse,
     /// Inferred from a well-known destination port only.
     PortHeuristic,
+}
+
+impl std::fmt::Display for ServiceEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Human names for report cells — Debug is for developers.
+        f.write_str(match self {
+            Self::SynAck => "syn-ack",
+            Self::AppLayer => "app-layer",
+            Self::UdpResponse => "udp-response",
+            Self::PortHeuristic => "port",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -82,8 +100,10 @@ pub struct Asset {
     services: BTreeMap<(u16, &'static str), ServiceEvidence>,
     pub dhcp_fingerprint: Option<String>,
     pub vendor_class: Option<String>,
-    pub first_seen: Timestamp,
-    pub last_seen: Timestamp,
+    /// `None` when every sighting came from timestamp-less records (pcapng
+    /// SPB) — absent, not the epoch.
+    pub first_seen: Option<Timestamp>,
+    pub last_seen: Option<Timestamp>,
 }
 
 /// Render the service map as the historical `Vec<Service>` JSON shape.
@@ -105,7 +125,7 @@ fn serialize_services<S: serde::Serializer>(
 }
 
 impl Asset {
-    fn new(key: AssetKey, ts: Timestamp) -> Self {
+    fn new(key: AssetKey, ts: Option<Timestamp>) -> Self {
         Self {
             key,
             macs: BTreeSet::new(),
@@ -123,20 +143,38 @@ impl Asset {
     /// seen by IP is later bound to a MAC, so the two records become one.
     /// Identity-preserving: keeps this asset's `key`, takes the union of
     /// addresses, the strongest hostname source, and the strongest service
-    /// evidence; widens the first/last-seen window.
-    fn merge_from(&mut self, other: Self, cap_hostnames: usize, cap_services: usize) {
+    /// evidence; widens the first/last-seen window. Returns how many
+    /// (hostnames, services, ips) the per-asset caps dropped, so
+    /// promotion-time overflow is counted like any other.
+    fn merge_from(
+        &mut self,
+        other: Self,
+        cap_hostnames: usize,
+        cap_services: usize,
+        cap_ips: usize,
+    ) -> (u64, u64, u64) {
+        let (mut dropped_names, mut dropped_services, mut dropped_ips) = (0u64, 0u64, 0u64);
         self.macs.extend(other.macs);
-        self.ips.extend(other.ips);
+        for ip in other.ips {
+            if self.add_ip(ip, cap_ips) {
+                dropped_ips = dropped_ips.saturating_add(1);
+            }
+        }
         for (name, source) in other.hostnames {
-            self.add_hostname(name, source, cap_hostnames);
+            if self.add_hostname(&name, source, cap_hostnames) {
+                dropped_names = dropped_names.saturating_add(1);
+            }
         }
         for ((port, proto), evidence) in other.services {
-            self.add_service(port, proto, evidence, cap_services);
+            if self.add_service(port, proto, evidence, cap_services) {
+                dropped_services = dropped_services.saturating_add(1);
+            }
         }
         self.dhcp_fingerprint = self.dhcp_fingerprint.take().or(other.dhcp_fingerprint);
         self.vendor_class = self.vendor_class.take().or(other.vendor_class);
-        self.first_seen = self.first_seen.min(other.first_seen);
+        self.first_seen = Timestamp::min_opt(self.first_seen, other.first_seen);
         self.last_seen = self.last_seen.max(other.last_seen);
+        (dropped_names, dropped_services, dropped_ips)
     }
 
     /// Services as the public `Service` view, sorted by port then proto.
@@ -163,12 +201,14 @@ impl Asset {
     }
 
     /// Returns `true` if the name was *dropped* at the per-asset cap (so the
-    /// inventory can count it) — degradation is never silent.
-    fn add_hostname(&mut self, name: String, source: NameSource, cap: usize) -> bool {
+    /// inventory can count it) — degradation is never silent. Borrowed `name`:
+    /// the steady state (the same mDNS name re-announced every packet) is a
+    /// pure map probe; the String is allocated only on the insert path.
+    fn add_hostname(&mut self, name: &str, source: NameSource, cap: usize) -> bool {
         if name.is_empty() {
             return false;
         }
-        if let Some(existing) = self.hostnames.get_mut(&name) {
+        if let Some(existing) = self.hostnames.get_mut(name) {
             if source < *existing {
                 *existing = source;
             }
@@ -178,7 +218,7 @@ impl Asset {
         if self.hostnames.len() >= cap {
             return true;
         }
-        self.hostnames.insert(name, source);
+        self.hostnames.insert(name.to_owned(), source);
         false
     }
 
@@ -206,6 +246,22 @@ impl Asset {
         self.services.insert((port, proto), evidence);
         false
     }
+
+    /// Returns `true` if a *new* IP was dropped at the per-asset cap. One MAC
+    /// spraying fresh IPv6 link-local sources — local by definition, no
+    /// subnet learning needed — would otherwise grow this one set with the
+    /// streamed file; `max_bindings` does not bound it because
+    /// `record_local_host` runs even when `bind()` dropped at its cap.
+    fn add_ip(&mut self, ip: IpAddr, cap: usize) -> bool {
+        if self.ips.contains(&ip) {
+            return false;
+        }
+        if self.ips.len() >= cap {
+            return true;
+        }
+        self.ips.insert(ip);
+        false
+    }
 }
 
 /// Tallies of what hostile floods forced us to drop — surfaced in reports so
@@ -217,12 +273,18 @@ pub struct AssetOverflow {
     pub subnets: u64,
     pub hostnames: u64,
     pub services: u64,
+    /// IPs dropped at the per-asset `max_ips_per_asset` cap.
+    pub ips: u64,
+    /// IPs whose MAC binding changed mid-capture (DHCP churn, VRRP failover,
+    /// spoofing) — flow attribution for these resolves through the *final*
+    /// binding and is therefore ambiguous.
+    pub rebound_ips: u64,
 }
 
 impl AssetOverflow {
     #[must_use]
     pub fn any(&self) -> bool {
-        self.assets | self.bindings | self.subnets | self.hostnames | self.services != 0
+        self.assets | self.bindings | self.subnets | self.hostnames | self.services | self.ips != 0
     }
 }
 
@@ -260,7 +322,7 @@ pub struct AssetInventory {
     /// *final* subnet knowledge in [`AssetInventory::finalize`]. This is what
     /// makes keying order-independent: a host whose frames arrive before the
     /// ARP/DHCP that establishes its subnet is still MAC-keyed at the end.
-    provisional: BTreeMap<IpAddr, (MacAddr, Timestamp)>,
+    provisional: BTreeMap<IpAddr, (MacAddr, Option<Timestamp>)>,
     finalized: bool,
     limits: Limits,
     overflow: AssetOverflow,
@@ -275,14 +337,17 @@ impl Default for AssetInventory {
 /// Mask assumed for a segment learned from ARP, which carries no netmask.
 const ARP_SUBNET_GUESS: u32 = 0xFFFF_FF00; // /24
 
-/// A valid IPv4 netmask is a contiguous run of 1 bits followed by 0 bits
-/// (e.g. `255.255.255.0`). `0` (no segment) and `0xFFFF_FFFF` (/32) are both
-/// rejected as not defining a useful local segment.
-fn is_contiguous_netmask(mask: u32) -> bool {
-    mask != 0 && mask != u32::MAX && {
+/// A plausible IPv4 netmask: a contiguous run of 1 bits followed by 0 bits
+/// (e.g. `255.255.255.0`), no shorter than /8 and no longer than /31. `0` and
+/// `0xFFFF_FFFF` define no useful segment, and no real L2 broadcast domain is
+/// wider than a /8 — without the floor, one hostile DHCP ACK claiming mask
+/// `128.0.0.0` would mark half the IPv4 internet "local" and collapse every
+/// routed host behind the gateway into the router's MAC.
+fn is_plausible_netmask(mask: u32) -> bool {
+    mask != u32::MAX && {
         let ones = mask.leading_ones();
         let zeros = mask.trailing_zeros();
-        ones + zeros == 32
+        ones + zeros == 32 && ones >= 8
     }
 }
 
@@ -318,14 +383,18 @@ impl AssetInventory {
         self.finalized = true;
         // Snapshot to satisfy the borrow checker; provisional is bounded by
         // max_bindings, so this is a small, one-time pass.
-        let pending: Vec<(IpAddr, MacAddr)> = self
+        let pending: Vec<(IpAddr, MacAddr, Option<Timestamp>)> = self
             .provisional
             .iter()
             .filter(|(ip, _)| !self.ip_to_mac.contains_key(ip) && self.is_local(**ip))
-            .map(|(ip, (mac, _))| (*ip, *mac))
+            .map(|(ip, (mac, ts))| (*ip, *mac, *ts))
             .collect();
-        for (ip, mac) in pending {
+        for (ip, mac, ts) in pending {
             self.bind(mac, ip);
+            // A data-frames-only host has no IP-keyed asset for bind() to
+            // promote; record it here, with the first-seen time the
+            // provisional actually observed, so the inventory lists it.
+            self.record_local_host(mac, Some(ip), ts);
         }
     }
 
@@ -346,6 +415,10 @@ impl AssetInventory {
     }
 
     /// Assets sorted by first-seen, then key — stable, readable order.
+    ///
+    /// Call [`AssetInventory::finalize`] first (the CLI always does): a
+    /// caller that skips it gets order-dependent keying for hosts whose
+    /// segment was learned after their first frames.
     #[must_use]
     pub fn assets(&self) -> Vec<&Asset> {
         let mut out: Vec<&Asset> = self.assets.values().collect();
@@ -374,13 +447,14 @@ impl AssetInventory {
     /// Record that `ip`'s subnet (under `mask`) is a local segment. Used with
     /// the real mask from DHCP option 1, or the /24 guess from ARP.
     fn learn_subnet(&mut self, ip: Ipv4Addr, mask: u32) {
-        // A real netmask is a run of 1s then 0s. A garbage option-1 value
-        // (e.g. 0x0F0F0F0F) would otherwise define a nonsense "segment" that
-        // is_local then uses to misclassify off-link hosts as local.
-        if !is_contiguous_netmask(mask) {
+        // A real netmask is a run of 1s then 0s, at least /8 wide. A garbage
+        // or hostile option-1 value (0x0F0F0F0F, 128.0.0.0) would otherwise
+        // define a nonsense "segment" that is_local then uses to misclassify
+        // off-link hosts as local.
+        if !is_plausible_netmask(mask) {
             return;
         }
-        if ip.is_unspecified() || ip.is_broadcast() {
+        if !is_unicast(IpAddr::V4(ip)) {
             return;
         }
         let network = u32::from(ip) & mask;
@@ -407,48 +481,72 @@ impl AssetInventory {
         if mac == MacAddr::BROADCAST || mac.is_multicast() || mac == MacAddr::ZERO {
             return;
         }
-        if ip.is_unspecified() {
+        // One predicate for every binding path: a multicast/broadcast IP is
+        // not a host and must never acquire a MAC binding (a hostile ARP can
+        // claim one; honoring it would key group traffic to a device).
+        if !is_unicast(ip) {
             return;
         }
-        // Rebinding a known IP (ARP refresh, or a spoofer reclaiming it) is
-        // free; only a brand-new IP counts against the cap. An ARP-spoof storm
-        // claiming millions of fresh IPs therefore stops growing the map.
-        let known = self.ip_to_mac.get(&ip).copied();
-        if known.is_none() && self.ip_to_mac.len() >= self.limits.max_bindings {
-            self.overflow.bindings = self.overflow.bindings.saturating_add(1);
-            return;
+        // One map descent via Entry (the FlowTable pattern). Rebinding a known
+        // IP (ARP refresh, or a spoofer reclaiming it) is free; only a
+        // brand-new IP counts against the cap. An ARP-spoof storm claiming
+        // millions of fresh IPs therefore stops growing the map.
+        let len = self.ip_to_mac.len();
+        match self.ip_to_mac.entry(ip) {
+            Entry::Occupied(mut entry) => {
+                if *entry.get() == mac {
+                    return; // unchanged refresh — the per-packet steady state
+                }
+                // An IP moving to a *different* MAC mid-capture (DHCP churn,
+                // VRRP failover, or spoofing) means flow attribution for that
+                // IP — which resolves through the final binding — is
+                // ambiguous. Count it so the degradation report can say so
+                // instead of silently misattributing.
+                self.overflow.rebound_ips = self.overflow.rebound_ips.saturating_add(1);
+                entry.insert(mac);
+            }
+            Entry::Vacant(entry) => {
+                if len >= self.limits.max_bindings {
+                    self.overflow.bindings = self.overflow.bindings.saturating_add(1);
+                    return;
+                }
+                entry.insert(mac);
+            }
         }
-        self.ip_to_mac.insert(ip, mac);
-        // First time this IP is bound to a MAC, fold any record we built while
-        // it was only known by IP into the MAC-keyed asset. Without this, a
+        // First binding (or a MAC change): fold any record we built while the
+        // host was only known by IP into the MAC-keyed asset. Without this, a
         // host named (DNS/mDNS) before its ARP/DHCP binding splits into two
         // assets and the inventory becomes order-dependent.
-        if known != Some(mac) {
-            self.promote_ip_asset(ip, mac);
-        }
+        self.promote_ip_asset(ip, mac);
     }
 
     /// Note a candidate IP→MAC pair seen on a data frame. Unlike [`bind`],
     /// this makes no locality claim yet — [`finalize`] decides, once all
     /// subnets are known. Bounded by `max_bindings`.
-    fn record_provisional(&mut self, mac: MacAddr, ip: IpAddr, ts: Timestamp) {
+    fn record_provisional(&mut self, mac: MacAddr, ip: IpAddr, ts: Option<Timestamp>) {
         if mac == MacAddr::BROADCAST || mac.is_multicast() || mac == MacAddr::ZERO {
             return;
         }
-        if ip.is_unspecified() || ip.is_multicast() {
+        if !is_unicast(ip) {
             return;
         }
-        if !self.provisional.contains_key(&ip) && self.provisional.len() >= self.limits.max_bindings
-        {
-            // Same flood backstop as bind(); count it under bindings so the
-            // drop is reported, not silent.
-            self.overflow.bindings = self.overflow.bindings.saturating_add(1);
-            return;
+        // One descent via Entry; the flood backstop (same as bind()) lives in
+        // the Vacant arm, counted under bindings so the drop is reported, not
+        // silent.
+        let len = self.provisional.len();
+        match self.provisional.entry(ip) {
+            Entry::Occupied(mut entry) => {
+                let (_, seen) = entry.get_mut();
+                *seen = Timestamp::min_opt(*seen, ts);
+            }
+            Entry::Vacant(entry) => {
+                if len >= self.limits.max_bindings {
+                    self.overflow.bindings = self.overflow.bindings.saturating_add(1);
+                    return;
+                }
+                entry.insert((mac, ts));
+            }
         }
-        self.provisional
-            .entry(ip)
-            .and_modify(|(_, seen)| *seen = (*seen).min(ts))
-            .or_insert((mac, ts));
     }
 
     /// Merge an `Ip(ip)`-keyed asset into the `Mac(mac)`-keyed asset, then drop
@@ -458,17 +556,24 @@ impl AssetInventory {
             return;
         };
         let ts = orphan.first_seen;
-        let (ch, cs) = (
+        let (ch, cs, ci) = (
             self.limits.max_hostnames_per_asset,
             self.limits.max_services_per_asset,
+            self.limits.max_ips_per_asset,
         );
         // `asset_mut` may return None only at the asset cap; since we just
         // removed one, there is room for the MAC-keyed target.
+        let mut dropped = (0u64, 0u64, 0u64);
         if let Some(target) = self.asset_mut(AssetKey::Mac(mac), ts) {
-            target.merge_from(orphan, ch, cs);
+            dropped = target.merge_from(orphan, ch, cs, ci);
             target.macs.insert(mac);
-            target.ips.insert(ip);
+            if target.add_ip(ip, ci) {
+                dropped.2 = dropped.2.saturating_add(1);
+            }
         }
+        self.overflow.hostnames = self.overflow.hostnames.saturating_add(dropped.0);
+        self.overflow.services = self.overflow.services.saturating_add(dropped.1);
+        self.overflow.ips = self.overflow.ips.saturating_add(dropped.2);
     }
 
     /// Is this IP plausibly on the local L2 segment? See the type docs. The
@@ -496,51 +601,103 @@ impl AssetInventory {
         }
     }
 
-    /// Get or create an asset. Returns `None` when the inventory is at
-    /// `max_assets` and this is a new identity — a random-source-IP flood then
-    /// stops creating assets (counted) instead of exhausting memory.
-    fn asset_mut(&mut self, key: AssetKey, ts: Timestamp) -> Option<&mut Asset> {
-        if !self.assets.contains_key(&key) && self.assets.len() >= self.limits.max_assets {
-            self.overflow.assets = self.overflow.assets.saturating_add(1);
-            return None;
+    /// Do these two IPs sit on one *learned* local segment? This is the trust
+    /// bound for resolver-style DNS answers: a local DNS server may name its
+    /// same-segment neighbors, but never an off-link IP. IPv4 requires a
+    /// shared learned subnet (DHCP option 1 or the ARP /24 guess); IPv6 reuses
+    /// the [`AssetInventory::is_local`] rule — link-local/ULA addresses seen
+    /// in one single-link capture share that link.
+    fn same_local_segment(&self, a: IpAddr, b: IpAddr) -> bool {
+        match (a, b) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                let (a, b) = (u32::from(a), u32::from(b));
+                self.local_v4_subnets
+                    .iter()
+                    .any(|(&mask, nets)| a & mask == b & mask && nets.contains(&(a & mask)))
+            }
+            (IpAddr::V6(_), IpAddr::V6(_)) => self.is_local(a) && self.is_local(b),
+            _ => false,
         }
-        Some(
-            self.assets
-                .entry(key)
-                .or_insert_with(|| Asset::new(key, ts)),
-        )
     }
 
-    fn record_local_host(&mut self, mac: MacAddr, ip: Option<IpAddr>, ts: Timestamp) {
+    /// Get or create an asset. Returns `None` when the inventory is at
+    /// `max_assets` and this is a new identity — a random-source-IP flood then
+    /// stops creating assets (counted) instead of exhausting memory. One map
+    /// descent via Entry (the `FlowTable` pattern), with the cap enforced in
+    /// the Vacant arm.
+    fn asset_mut(&mut self, key: AssetKey, ts: Option<Timestamp>) -> Option<&mut Asset> {
+        let len = self.assets.len();
+        match self.assets.entry(key) {
+            Entry::Occupied(entry) => Some(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                if len >= self.limits.max_assets {
+                    self.overflow.assets = self.overflow.assets.saturating_add(1);
+                    return None;
+                }
+                Some(entry.insert(Asset::new(key, ts)))
+            }
+        }
+    }
+
+    fn record_local_host(&mut self, mac: MacAddr, ip: Option<IpAddr>, ts: Option<Timestamp>) {
         if mac == MacAddr::BROADCAST || mac.is_multicast() || mac == MacAddr::ZERO {
             return;
         }
+        let cap = self.limits.max_ips_per_asset;
         let Some(asset) = self.asset_mut(AssetKey::Mac(mac), ts) else {
             return;
         };
         asset.macs.insert(mac);
         asset.last_seen = asset.last_seen.max(ts);
-        asset.first_seen = asset.first_seen.min(ts);
-        if let Some(ip) = ip.filter(|ip| !ip.is_unspecified() && !ip.is_multicast()) {
-            asset.ips.insert(ip);
+        asset.first_seen = Timestamp::min_opt(asset.first_seen, ts);
+        let dropped = ip
+            .filter(|ip| !ip.is_unspecified() && !ip.is_multicast())
+            .is_some_and(|ip| asset.add_ip(ip, cap));
+        if dropped {
+            self.overflow.ips = self.overflow.ips.saturating_add(1);
         }
     }
 
-    fn observe_arp(&mut self, arp: &ArpView, ts: Timestamp) {
-        // ARP is authoritative: sender MAC and sender IP are on this segment.
+    fn observe_arp(&mut self, arp: &ArpView, ts: Option<Timestamp>) {
+        // Unknown opcodes carry the right field layout but unknowable
+        // semantics — no trust.
+        if !matches!(arp.op, ArpOp::Request | ArpOp::Reply) {
+            return;
+        }
+        // Sender fields are authoritative in requests and replies alike: both
+        // place the speaker's own MAC/IP there, on this segment.
         self.bind_authoritative(arp.sender_mac, IpAddr::V4(arp.sender_ip));
         self.record_local_host(arp.sender_mac, Some(IpAddr::V4(arp.sender_ip)), ts);
-        if !arp.target_ip.is_unspecified() && arp.target_mac != MacAddr::ZERO {
+        // Target fields are only assertions in a REPLY; in a request they are
+        // the *question* (zero or stale), not evidence.
+        if matches!(arp.op, ArpOp::Reply)
+            && !arp.target_ip.is_unspecified()
+            && arp.target_mac != MacAddr::ZERO
+        {
             self.bind_authoritative(arp.target_mac, IpAddr::V4(arp.target_ip));
             self.record_local_host(arp.target_mac, Some(IpAddr::V4(arp.target_ip)), ts);
         }
     }
 
-    fn observe_app(&mut self, pkt: &PacketView<'_>, app: &AppEvent, ts: Timestamp) {
+    fn observe_app(&mut self, pkt: &PacketView<'_>, app: &AppEvent, ts: Option<Timestamp>) {
         match app {
             AppEvent::Dhcp(dhcp) => {
-                // Authoritative MAC↔IP binding plus the device fingerprint.
-                if let Some(ip) = dhcp.your_ip.or(dhcp.requested_ip) {
+                // A relayed exchange (giaddr set) describes a client on a
+                // *different* segment: chaddr is an off-link MAC and option 1
+                // names the remote subnet. Recording it as local evidence
+                // would mark remote segments local and merge their routed
+                // hosts into the router's MAC-keyed asset.
+                if dhcp.relay_ip.is_some() {
+                    return;
+                }
+                // Only a server-confirmed assignment binds: the ACK's yiaddr.
+                // An OFFER may go unaccepted, and option 50 (requested IP) is
+                // an unverified client claim — typically a roaming device's
+                // stale lease from a different network.
+                let confirmed_ip = (dhcp.msg_type == DhcpMsgType::Ack)
+                    .then_some(dhcp.your_ip)
+                    .flatten();
+                if let Some(ip) = confirmed_ip {
                     self.bind_authoritative(dhcp.client_mac, IpAddr::V4(ip));
                     // Option 1 gives the real subnet mask — learn the actual
                     // segment size, overriding the ARP /24 guess.
@@ -548,8 +705,8 @@ impl AssetInventory {
                         self.learn_subnet(ip, u32::from(mask));
                     }
                 }
-                self.record_local_host(dhcp.client_mac, dhcp.your_ip.map(IpAddr::V4), ts);
-                if let Some(host) = dhcp.hostname.clone() {
+                self.record_local_host(dhcp.client_mac, confirmed_ip.map(IpAddr::V4), ts);
+                if let Some(host) = dhcp.hostname.as_deref() {
                     self.attribute_hostname(
                         AssetKey::Mac(dhcp.client_mac),
                         host,
@@ -558,39 +715,79 @@ impl AssetInventory {
                     );
                 }
                 if let Some(asset) = self.asset_mut(AssetKey::Mac(dhcp.client_mac), ts) {
-                    if !dhcp.param_req_list.is_empty() {
+                    // Compare before replacing: the steady state (the same
+                    // device re-DHCPing with an unchanged option 55 / vendor
+                    // class) must not re-allocate per packet; a changed value
+                    // still updates — last wins, as before.
+                    if !dhcp.param_req_list.is_empty()
+                        && !fingerprint_unchanged(
+                            asset.dhcp_fingerprint.as_deref(),
+                            &dhcp.param_req_list,
+                        )
+                    {
                         asset.dhcp_fingerprint = Some(dhcp.fingerprint());
                     }
-                    if let Some(vendor) = &dhcp.vendor_class {
-                        asset.vendor_class = Some(vendor.clone());
+                    if let Some(vendor) = dhcp.vendor_class.as_deref()
+                        && asset.vendor_class.as_deref() != Some(vendor)
+                    {
+                        asset.vendor_class = Some(vendor.to_owned());
                     }
                 }
             }
             AppEvent::Dns(dns) => {
-                // A/AAAA answers name the *server* IP; attribute to its asset.
+                // A/AAAA answers are unauthenticated bytes naming a *claimed*
+                // IP. Two gates before any inventory write. First: only
+                // responses carry naming evidence — answer records riding on
+                // a query (qr=0) are either a poisoning attempt or mDNS
+                // known-answer suppression (the querier's cache, not a
+                // claim). Second: trust a host to name *itself* (mDNS
+                // announces, the normal case), or — resolver-style — a
+                // neighbor on the same learned local segment; a record
+                // claiming an off-segment IP would let any spoofed datagram
+                // rewrite an arbitrary victim's reported identity.
+                if !dns.is_response {
+                    return;
+                }
+                let Some((src, _)) = pkt.ip_pair() else {
+                    return;
+                };
                 for answer in &dns.answers {
                     let (ip, source) = match &answer.data {
                         DnsRData::A(ip) => (IpAddr::V4(*ip), source_for(dns.is_mdns)),
                         DnsRData::Aaaa(ip) => (IpAddr::V6(*ip), source_for(dns.is_mdns)),
                         _ => continue,
                     };
-                    let key = self.key_for_ip(ip);
-                    if let Some(asset) = self.asset_mut(key, ts) {
-                        asset.ips.insert(ip);
+                    // is_unicast on both sides: a claimed broadcast address
+                    // falls inside its segment's learned subnet, and a
+                    // multicast "host" is not an asset.
+                    if !is_unicast(ip) || !is_unicast(src) {
+                        continue;
                     }
-                    self.attribute_hostname(key, answer.name.clone(), source, ts);
+                    if ip != src && !self.same_local_segment(src, ip) {
+                        continue;
+                    }
+                    let cap = self.limits.max_ips_per_asset;
+                    let key = self.key_for_ip(ip);
+                    let dropped = match self.asset_mut(key, ts) {
+                        Some(asset) => asset.add_ip(ip, cap),
+                        None => false, // asset-cap drop already counted
+                    };
+                    if dropped {
+                        self.overflow.ips = self.overflow.ips.saturating_add(1);
+                    }
+                    self.attribute_hostname(key, &answer.name, source, ts);
                 }
             }
             AppEvent::Tls(hello) => {
-                if let (Some(sni), Some((_, dst))) = (&hello.sni, pkt.ip_pair()) {
+                if let (Some(sni), Some((_, dst))) = (hello.sni.as_deref(), pkt.ip_pair()) {
                     let key = self.key_for_ip(dst);
-                    self.attribute_hostname(key, sni.clone(), NameSource::Tls, ts);
+                    self.attribute_hostname(key, sni, NameSource::Tls, ts);
                 }
             }
             AppEvent::Http(req) => {
-                if let (Some(host), Some((_, dst))) = (&req.host, pkt.ip_pair()) {
+                if let (Some(host), Some((_, dst))) = (req.host.as_deref(), pkt.ip_pair()) {
                     let key = self.key_for_ip(dst);
-                    self.attribute_hostname(key, host.clone(), NameSource::Http, ts);
+                    self.attribute_hostname(key, host, NameSource::Http, ts);
                 }
             }
         }
@@ -599,12 +796,13 @@ impl AssetInventory {
     /// Add a hostname to an asset and count it if the per-asset cap dropped it
     /// — so a name flood from *any* source (DNS, mDNS, DHCP, TLS, HTTP) shows
     /// in `overflow.hostnames`, never silently. One home for all four sources.
+    /// Borrowed `name`: only [`Asset::add_hostname`]'s insert path allocates.
     fn attribute_hostname(
         &mut self,
         key: AssetKey,
-        name: String,
+        name: &str,
         source: NameSource,
-        ts: Timestamp,
+        ts: Option<Timestamp>,
     ) {
         let cap = self.limits.max_hostnames_per_asset;
         let dropped = match self.asset_mut(key, ts) {
@@ -623,12 +821,13 @@ impl AssetInventory {
         &mut self,
         key: AssetKey,
         port: u16,
+        proto: &'static str,
         evidence: ServiceEvidence,
-        ts: Timestamp,
+        ts: Option<Timestamp>,
     ) {
         let cap = self.limits.max_services_per_asset;
         let dropped = match self.asset_mut(key, ts) {
-            Some(asset) => asset.add_service(port, "tcp", evidence, cap),
+            Some(asset) => asset.add_service(port, proto, evidence, cap),
             None => return,
         };
         if dropped {
@@ -637,11 +836,33 @@ impl AssetInventory {
     }
 }
 
+/// Is `stored` exactly [`crate::app::DhcpSummary::fingerprint`] of `list`,
+/// decided without building the string? `fingerprint()` output is canonical
+/// decimal (no signs, no leading zeros), so the numeric per-part comparison
+/// is exact — and the steady state (unchanged option 55) costs no allocation.
+fn fingerprint_unchanged(stored: Option<&str>, list: &[u8]) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    let mut parts = stored.split(',');
+    list.iter()
+        .all(|code| parts.next().and_then(|part| part.parse::<u8>().ok()) == Some(*code))
+        && parts.next().is_none()
+}
+
 const fn source_for(is_mdns: bool) -> NameSource {
     if is_mdns {
         NameSource::Mdns
     } else {
         NameSource::DnsAnswer
+    }
+}
+
+/// Neither broadcast, multicast, nor unspecified — an attributable host.
+fn is_unicast(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_broadcast() && !v4.is_multicast(),
+        IpAddr::V6(v6) => !v6.is_unspecified() && !v6.is_multicast(),
     }
 }
 
@@ -682,10 +903,41 @@ impl Observe for AssetInventory {
         {
             if tcp.flags.is_syn_ack() {
                 let key = self.key_for_ip(src_ip);
-                self.attribute_service(key, tcp.src_port, ServiceEvidence::SynAck, ts);
+                self.attribute_service(key, tcp.src_port, "tcp", ServiceEvidence::SynAck, ts);
             } else if tcp.flags.is_initial_syn() && is_service_port(tcp.dst_port) {
                 let key = self.key_for_ip(dst_ip);
-                self.attribute_service(key, tcp.dst_port, ServiceEvidence::PortHeuristic, ts);
+                self.attribute_service(
+                    key,
+                    tcp.dst_port,
+                    "tcp",
+                    ServiceEvidence::PortHeuristic,
+                    ts,
+                );
+            }
+        }
+
+        // Service evidence from UDP: there is no handshake, so direction
+        // relative to a well-known port is the signal — a datagram FROM a
+        // service port answering an ephemeral one is a listener responding.
+        // Multicast/broadcast chatter (mDNS, SSDP, DHCP) is not attributed:
+        // a multicast group is not a host running a service.
+        if let Some(TransportView::Udp(udp)) = &pkt.transport
+            && let Some((src_ip, dst_ip)) = pkt.ip_pair()
+        {
+            let src_svc = is_service_port(udp.src_port);
+            let dst_svc = is_service_port(udp.dst_port);
+            if src_svc && !dst_svc && is_unicast(src_ip) && is_unicast(dst_ip) {
+                let key = self.key_for_ip(src_ip);
+                self.attribute_service(key, udp.src_port, "udp", ServiceEvidence::UdpResponse, ts);
+            } else if dst_svc && !src_svc && is_unicast(dst_ip) {
+                let key = self.key_for_ip(dst_ip);
+                self.attribute_service(
+                    key,
+                    udp.dst_port,
+                    "udp",
+                    ServiceEvidence::PortHeuristic,
+                    ts,
+                );
             }
         }
 
@@ -696,7 +948,18 @@ impl Observe for AssetInventory {
                 && let Some(TransportView::Tcp(tcp)) = &pkt.transport
             {
                 let key = self.key_for_ip(dst);
-                self.attribute_service(key, tcp.dst_port, ServiceEvidence::AppLayer, ts);
+                self.attribute_service(key, tcp.dst_port, "tcp", ServiceEvidence::AppLayer, ts);
+            }
+            // A unicast DNS answer from port 53 is application-layer proof of
+            // a DNS service on the responder.
+            if let (AppEvent::Dns(dns), Some((src, _))) = (event, pkt.ip_pair())
+                && let Some(TransportView::Udp(udp)) = &pkt.transport
+                && !dns.is_mdns
+                && udp.src_port == 53
+                && is_unicast(src)
+            {
+                let key = self.key_for_ip(src);
+                self.attribute_service(key, 53, "udp", ServiceEvidence::AppLayer, ts);
             }
         }
     }
@@ -754,6 +1017,355 @@ mod tests {
         assert!(
             !inv.is_local(v4(93, 184, 216, 34)),
             "public IP behind the router"
+        );
+    }
+
+    /// Build a DHCP frame and run it through decode + sniff + observe, the
+    /// same path the real pipeline takes.
+    fn observe_dhcp(
+        inv: &mut AssetInventory,
+        msg_type: u8,
+        mac: MacAddr,
+        opts: &crate::fixtures::DhcpOptions<'_>,
+    ) {
+        let frame = crate::fixtures::Packet::ethernet(mac, MacAddr::BROADCAST)
+            .ipv4(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST)
+            .udp(68, 67)
+            .payload(&crate::fixtures::dhcp(msg_type, mac, 0x42, opts));
+        let record = crate::pcap::Record {
+            ts: Some(Timestamp::ZERO),
+            orig_len: u32::try_from(frame.len()).unwrap_or(0),
+            link_type: crate::pcap::LinkType::Ethernet,
+            data: &frame,
+        };
+        let Ok(pkt) = crate::decode::decode_packet(&record) else {
+            unreachable!("fixture frame must decode");
+        };
+        let app = crate::app::sniff(&pkt);
+        inv.observe(&pkt, app.as_ref());
+    }
+
+    #[test]
+    fn dhcp_client_claims_do_not_bind() {
+        // Option 50 in a DISCOVER is an unverified client claim — a roaming
+        // laptop's stale lease from another network must not bind nor seed a
+        // local segment.
+        let mut inv = AssetInventory::new();
+        let mac = MacAddr([0x3C, 0, 0, 0, 0, 1]);
+        let opts = crate::fixtures::DhcpOptions {
+            requested_ip: Some(Ipv4Addr::new(172, 16, 9, 7)),
+            ..crate::fixtures::DhcpOptions::default()
+        };
+        observe_dhcp(&mut inv, 1, mac, &opts); // DISCOVER
+        assert!(
+            !inv.is_local(v4(172, 16, 9, 200)),
+            "client-claimed IP must not seed a local segment"
+        );
+
+        // An OFFER is a proposal, not a confirmed lease: still no binding.
+        let offer = crate::fixtures::DhcpOptions {
+            your_ip: Some(Ipv4Addr::new(192, 168, 5, 10)),
+            ..crate::fixtures::DhcpOptions::default()
+        };
+        observe_dhcp(&mut inv, 2, mac, &offer);
+        assert!(!inv.is_local(v4(192, 168, 5, 20)), "OFFER must not bind");
+
+        // The ACK's yiaddr is server-confirmed: now it binds and seeds.
+        observe_dhcp(&mut inv, 5, mac, &offer);
+        assert!(inv.is_local(v4(192, 168, 5, 20)), "ACK binds");
+    }
+
+    #[test]
+    fn dhcp_fingerprint_and_vendor_class_track_the_latest_packet() {
+        // Compare-before-replace must stay last-wins, not become first-wins:
+        // an unchanged repeat is a no-op, a changed option 55 list / vendor
+        // class still updates the asset.
+        let mut inv = AssetInventory::new();
+        let mac = MacAddr([0x3C, 0, 0, 0, 0, 7]);
+        let first = crate::fixtures::DhcpOptions {
+            vendor_class: Some("MSFT 5.0"),
+            param_req_list: &[1, 3, 6],
+            ..crate::fixtures::DhcpOptions::default()
+        };
+        observe_dhcp(&mut inv, 1, mac, &first);
+        observe_dhcp(&mut inv, 1, mac, &first); // unchanged repeat
+        let second = crate::fixtures::DhcpOptions {
+            vendor_class: Some("android-dhcp-13"),
+            param_req_list: &[1, 121, 3],
+            ..crate::fixtures::DhcpOptions::default()
+        };
+        observe_dhcp(&mut inv, 1, mac, &second);
+        let assets = inv.assets();
+        let asset = assets
+            .iter()
+            .find(|a| a.key == AssetKey::Mac(mac))
+            .unwrap_or_else(|| unreachable!("dhcp client must be inventoried"));
+        assert_eq!(asset.dhcp_fingerprint.as_deref(), Some("1,121,3"));
+        assert_eq!(asset.vendor_class.as_deref(), Some("android-dhcp-13"));
+    }
+
+    #[test]
+    fn fingerprint_comparison_is_exact() {
+        assert!(fingerprint_unchanged(Some("1,3,6"), &[1, 3, 6]));
+        assert!(!fingerprint_unchanged(Some("1,3,6"), &[1, 3]));
+        assert!(!fingerprint_unchanged(Some("1,3"), &[1, 3, 6]));
+        assert!(!fingerprint_unchanged(Some("1,3,6"), &[1, 3, 7]));
+        assert!(!fingerprint_unchanged(None, &[1]));
+    }
+
+    #[test]
+    fn implausible_masks_define_no_segment() {
+        let mut inv = AssetInventory::new();
+        // /1: one hostile ACK would otherwise mark half of IPv4 "local".
+        inv.learn_subnet(Ipv4Addr::new(10, 0, 0, 1), 0x8000_0000);
+        assert!(!inv.is_local(v4(10, 200, 0, 1)), "/1 must be rejected");
+        // /7 still under the floor; /8 is the widest believable segment.
+        inv.learn_subnet(Ipv4Addr::new(10, 0, 0, 1), 0xFE00_0000);
+        assert!(!inv.is_local(v4(10, 200, 0, 1)), "/7 must be rejected");
+        inv.learn_subnet(Ipv4Addr::new(10, 0, 0, 1), 0xFF00_0000);
+        assert!(inv.is_local(v4(10, 200, 0, 1)), "/8 is accepted");
+    }
+
+    #[test]
+    fn finalize_records_data_frames_only_hosts() {
+        // A host seen only as data frames, whose segment is learned later:
+        // finalize must both bind it AND create its inventory record, with
+        // the first-seen time the provisional observed.
+        let mut inv = AssetInventory::new();
+        let mac = MacAddr([0x3C, 0, 0, 0, 0, 9]);
+        let ip = v4(192, 168, 7, 42);
+        inv.record_provisional(mac, ip, Some(Timestamp::new(100, 0)));
+        inv.learn_subnet(Ipv4Addr::new(192, 168, 7, 1), 0xFFFF_FF00);
+        inv.finalize();
+        let assets = inv.assets();
+        let asset = assets
+            .iter()
+            .find(|a| a.key == AssetKey::Mac(mac))
+            .unwrap_or_else(|| unreachable!("host must appear in the inventory"));
+        assert!(asset.ips.contains(&ip));
+        assert_eq!(asset.first_seen, Some(Timestamp::new(100, 0)));
+    }
+
+    #[test]
+    fn udp_response_is_service_evidence_but_multicast_is_not() {
+        let mut inv = AssetInventory::new();
+        let server = MacAddr([0xAA, 0, 0, 0, 0, 1]);
+        let client = MacAddr([0xBB, 0, 0, 0, 0, 2]);
+        // DNS server answers an ephemeral port: udp/53 service on the server.
+        let frame = crate::fixtures::Packet::ethernet(server, client)
+            .ipv4(Ipv4Addr::new(10, 0, 0, 53), Ipv4Addr::new(10, 0, 0, 9))
+            .udp(53, 51000)
+            .payload(&[0u8; 16]);
+        observe_frame(&mut inv, &frame);
+        let assets = inv.assets();
+        let dns_server = assets
+            .iter()
+            .find(|a| a.key == AssetKey::Ip(v4(10, 0, 0, 53)))
+            .unwrap_or_else(|| unreachable!("server asset exists"));
+        assert!(
+            dns_server
+                .services()
+                .iter()
+                .any(|s| s.port == 53 && s.proto == "udp"),
+            "udp/53 must be inventoried"
+        );
+
+        // mDNS chatter to a multicast group must NOT become a "service".
+        let mut inv = AssetInventory::new();
+        let frame = crate::fixtures::Packet::ethernet(client, MacAddr([0x01, 0, 0x5E, 0, 0, 0xFB]))
+            .ipv4(Ipv4Addr::new(10, 0, 0, 9), Ipv4Addr::new(224, 0, 0, 251))
+            .udp(5353, 5353)
+            .payload(&[0u8; 16]);
+        observe_frame(&mut inv, &frame);
+        assert!(
+            inv.assets()
+                .iter()
+                .all(|a| a.key != AssetKey::Ip(v4(224, 0, 0, 251))),
+            "multicast groups are not assets"
+        );
+    }
+
+    #[test]
+    fn ip_rebinding_is_counted_not_silent() {
+        let mut inv = AssetInventory::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 5);
+        inv.bind_authoritative(MacAddr([2, 0, 0, 0, 0, 1]), IpAddr::V4(ip));
+        assert_eq!(inv.overflow().rebound_ips, 0);
+        // Same IP claimed by a different MAC: churn/failover/spoof — counted.
+        inv.bind_authoritative(MacAddr([2, 0, 0, 0, 0, 2]), IpAddr::V4(ip));
+        assert_eq!(inv.overflow().rebound_ips, 1);
+    }
+
+    /// Decode + sniff + observe an arbitrary fixture frame — the same path
+    /// the real pipeline takes.
+    fn observe_frame(inv: &mut AssetInventory, frame: &[u8]) {
+        let record = crate::pcap::Record {
+            ts: Some(Timestamp::ZERO),
+            orig_len: u32::try_from(frame.len()).unwrap_or(0),
+            link_type: crate::pcap::LinkType::Ethernet,
+            data: frame,
+        };
+        let Ok(pkt) = crate::decode::decode_packet(&record) else {
+            unreachable!("fixture frame must decode");
+        };
+        let app = crate::app::sniff(&pkt);
+        inv.observe(&pkt, app.as_ref());
+    }
+
+    /// A DNS *query* (qr=0) that smuggles an A answer — the wire shape of a
+    /// poisoning attempt (or mDNS known-answer suppression, which is the
+    /// querier's cache, not a claim).
+    fn dns_query_with_answer(name: &str, addr: Ipv4Addr) -> Vec<u8> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0x4242u16.to_be_bytes()); // id
+        msg.extend_from_slice(&[0x00, 0x00]); // qr=0: a query...
+        msg.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]); // ...carrying 1 answer
+        msg.extend_from_slice(&crate::fixtures::dns_name(name));
+        msg.extend_from_slice(&[0, 1, 0, 1]); // A, IN
+        msg.extend_from_slice(&60u32.to_be_bytes()); // ttl
+        msg.extend_from_slice(&[0, 4]);
+        msg.extend_from_slice(&addr.octets());
+        msg
+    }
+
+    fn any_hostname(inv: &AssetInventory, name: &str) -> bool {
+        inv.assets()
+            .iter()
+            .any(|a| a.hostnames.keys().any(|h| h == name))
+    }
+
+    #[test]
+    fn dns_answers_riding_on_queries_attribute_nothing() {
+        // Attacker and victim share a learned segment, so only the qr gate
+        // stands between the smuggled record and the inventory.
+        let mut inv = AssetInventory::new();
+        inv.bind_authoritative(MacAddr([2, 0, 0, 0, 0, 1]), v4(10, 0, 0, 66));
+        let frame = crate::fixtures::Packet::ethernet(
+            MacAddr([2, 0, 0, 0, 0, 1]),
+            MacAddr([0x01, 0, 0x5E, 0, 0, 0xFB]),
+        )
+        .ipv4(Ipv4Addr::new(10, 0, 0, 66), Ipv4Addr::new(224, 0, 0, 251))
+        .udp(5353, 5353)
+        .payload(&dns_query_with_answer(
+            "evil.local",
+            Ipv4Addr::new(10, 0, 0, 9),
+        ));
+        observe_frame(&mut inv, &frame);
+        assert!(
+            !any_hostname(&inv, "evil.local"),
+            "a query carrying answer records must attribute nothing"
+        );
+    }
+
+    #[test]
+    fn dns_answer_naming_off_segment_ip_is_not_attributed() {
+        // ARP teaches 192.168.1.0/24; the on-segment attacker then "responds"
+        // with `evil.example IN A <off-segment victim>`. The claimed IP is
+        // neither the speaker nor on a learned segment: no attribution, and
+        // the forged record must not even create the victim's asset.
+        let mut inv = AssetInventory::new();
+        let attacker = MacAddr([2, 0, 0, 0, 0, 0x66]);
+        let victim_ip = v4(93, 184, 216, 34);
+        let arp = crate::fixtures::Packet::ethernet(attacker, MacAddr::BROADCAST).arp_reply(
+            Ipv4Addr::new(192, 168, 1, 66),
+            MacAddr([2, 0, 0, 0, 0, 2]),
+            Ipv4Addr::new(192, 168, 1, 9),
+        );
+        observe_frame(&mut inv, &arp);
+        let frame = crate::fixtures::Packet::ethernet(attacker, MacAddr([2, 0, 0, 0, 0, 2]))
+            .ipv4(
+                Ipv4Addr::new(192, 168, 1, 66),
+                Ipv4Addr::new(192, 168, 1, 9),
+            )
+            .udp(53, 51000)
+            .payload(&crate::fixtures::dns_response_a(
+                7,
+                "evil.example",
+                Ipv4Addr::new(93, 184, 216, 34),
+            ));
+        observe_frame(&mut inv, &frame);
+        assert!(
+            !any_hostname(&inv, "evil.example"),
+            "an off-segment claim must not name the victim"
+        );
+        assert!(
+            inv.assets()
+                .iter()
+                .all(|a| a.key != AssetKey::Ip(victim_ip)),
+            "a forged record must not create the victim's asset"
+        );
+    }
+
+    #[test]
+    fn mdns_self_announcement_still_attributes() {
+        // The normal mDNS case: a host announces its own A record. Source IP
+        // equals the claimed IP, so this passes with no segment learned at
+        // all — keeping attribution order-independent for self-claims.
+        let mut inv = AssetInventory::new();
+        let phone = MacAddr([0xD0, 0x81, 0x7A, 0, 0, 7]);
+        let ip = Ipv4Addr::new(192, 168, 1, 77);
+        let frame = crate::fixtures::Packet::ethernet(phone, MacAddr([0x01, 0, 0x5E, 0, 0, 0xFB]))
+            .ipv4(ip, Ipv4Addr::new(224, 0, 0, 251))
+            .udp(5353, 5353)
+            .payload(&crate::fixtures::mdns_announce_a("franks-iphone.local", ip));
+        observe_frame(&mut inv, &frame);
+        let asset = inv
+            .assets()
+            .into_iter()
+            .find(|a| a.ips.contains(&IpAddr::V4(ip)))
+            .unwrap_or_else(|| unreachable!("self-announced asset must exist"));
+        assert!(
+            asset.hostnames.keys().any(|h| h == "franks-iphone.local"),
+            "a self-announcement must still attribute"
+        );
+    }
+
+    #[test]
+    fn local_resolver_may_name_same_segment_neighbors() {
+        // Resolver-style cross-host naming is kept *within* a learned
+        // segment: the gateway's DNS answers `printer.lan IN A 192.168.1.30`
+        // and the printer's asset gets the name.
+        let mut inv = AssetInventory::new();
+        inv.bind_authoritative(MacAddr([0xAA, 0, 0xCC, 0, 0, 1]), v4(192, 168, 1, 1));
+        let frame = crate::fixtures::Packet::ethernet(
+            MacAddr([0xAA, 0, 0xCC, 0, 0, 1]),
+            MacAddr([0x3C, 0, 0, 0, 0, 1]),
+        )
+        .ipv4(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 10),
+        )
+        .udp(53, 51000)
+        .payload(&crate::fixtures::dns_response_a(
+            9,
+            "printer.lan",
+            Ipv4Addr::new(192, 168, 1, 30),
+        ));
+        observe_frame(&mut inv, &frame);
+        let printer = inv
+            .assets()
+            .into_iter()
+            .find(|a| a.ips.contains(&v4(192, 168, 1, 30)))
+            .unwrap_or_else(|| unreachable!("printer asset must exist"));
+        assert!(printer.hostnames.keys().any(|h| h == "printer.lan"));
+    }
+
+    #[test]
+    fn relayed_dhcp_does_not_learn_remote_segment() {
+        // An ACK relayed from another segment (giaddr set) carries a remote
+        // yiaddr and the remote subnet's real mask. Learning it as local
+        // would merge every routed host of that segment into the router MAC.
+        let mut inv = AssetInventory::new();
+        let opts = crate::fixtures::DhcpOptions {
+            your_ip: Some(Ipv4Addr::new(10, 9, 0, 50)),
+            subnet_mask: Some(Ipv4Addr::new(255, 255, 0, 0)),
+            relay_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
+            ..crate::fixtures::DhcpOptions::default()
+        };
+        observe_dhcp(&mut inv, 5, MacAddr([0x3C, 0, 0, 0, 0, 2]), &opts);
+        assert!(
+            !inv.is_local(v4(10, 9, 3, 3)),
+            "relayed exchange must not mark a remote segment local"
         );
     }
 }

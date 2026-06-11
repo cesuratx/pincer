@@ -20,7 +20,10 @@ pub const TYPE_PTR: u16 = 12;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_SRV: u16 = 33;
 
-/// Sanity caps for hostile counts/structures.
+/// Walk caps: bound the per-message work (name decompression per entry) a
+/// hostile flood can demand. Exceeding a cap does NOT reject the message —
+/// entries are parsed up to the cap and the rest are dropped, keeping the
+/// evidence a legitimate oversized mDNS burst carries.
 const MAX_QUESTIONS: u16 = 32;
 const MAX_RECORDS: u16 = 128;
 const MAX_POINTER_JUMPS: u8 = 16;
@@ -62,10 +65,20 @@ pub struct DnsSummary {
 /// Parse a DNS/mDNS message. `None` = does not look like DNS.
 #[must_use]
 pub fn parse(payload: &[u8], is_mdns: bool) -> Option<DnsSummary> {
-    parse_inner(payload, is_mdns).ok()
+    parse_inner(payload, is_mdns, true).ok()
 }
 
-fn parse_inner(msg: &[u8], is_mdns: bool) -> Result<DnsSummary, DecodeError> {
+/// Validation-only parse for label-level consumers (`flows`, `summary`): the
+/// payload is walked with exactly the same caps and bounds as [`parse`] — so
+/// accept/reject, and therefore the protocol label, cannot diverge — but no
+/// query or answer detail is materialized (`queries`/`answers` stay empty,
+/// nothing allocates).
+#[must_use]
+pub fn parse_shallow(payload: &[u8], is_mdns: bool) -> Option<DnsSummary> {
+    parse_inner(payload, is_mdns, false).ok()
+}
+
+fn parse_inner(msg: &[u8], is_mdns: bool, detail: bool) -> Result<DnsSummary, DecodeError> {
     let mut cur = Cursor::new(msg);
     let id = cur.u16_be()?;
     let flags = cur.u16_be()?;
@@ -74,15 +87,19 @@ fn parse_inner(msg: &[u8], is_mdns: bool) -> Result<DnsSummary, DecodeError> {
     let ns_count = cur.u16_be()?;
     let extra_count = cur.u16_be()?;
 
-    if qd_count > MAX_QUESTIONS {
-        return Err(DecodeError::malformed("dns", "implausible question count"));
-    }
-    let record_total = an_count
-        .saturating_add(ns_count)
-        .saturating_add(extra_count);
-    if record_total > MAX_RECORDS {
-        return Err(DecodeError::malformed("dns", "implausible record count"));
-    }
+    // Keep-what-we-have at the caps, never reject the whole message (real
+    // mDNS bursts legitimately exceed them). Records sit *after* the question
+    // section, so when the question count overflows its cap the records can
+    // no longer be located — evidence then stops at the parsed questions.
+    let walk_questions = qd_count.min(MAX_QUESTIONS);
+    let record_total = if qd_count > MAX_QUESTIONS {
+        0
+    } else {
+        an_count
+            .saturating_add(ns_count)
+            .saturating_add(extra_count)
+            .min(MAX_RECORDS)
+    };
     // Opcode must be QUERY(0) for anything we care about.
     if (flags >> 11) & 0x0F != 0 {
         return Err(DecodeError::malformed("dns", "non-query opcode"));
@@ -96,30 +113,50 @@ fn parse_inner(msg: &[u8], is_mdns: bool) -> Result<DnsSummary, DecodeError> {
         answers: Vec::new(),
     };
 
-    for _ in 0..qd_count {
-        let (name, next) = parse_name(msg, cur.pos(), msg.len())?;
+    for _ in 0..walk_questions {
+        let (name, next) = if detail {
+            let (name, next) = parse_name(msg, cur.pos(), msg.len())?;
+            (Some(name), next)
+        } else {
+            (None, skip_name(msg, cur.pos(), msg.len())?)
+        };
         cur = Cursor::at(msg, next)?;
         let qtype = cur.u16_be()?;
         cur.u16_be()?; // class (mDNS QU bit lives here; irrelevant to us)
-        summary.queries.push(DnsQuery { name, qtype });
+        if let Some(name) = name {
+            summary.queries.push(DnsQuery { name, qtype });
+        }
     }
 
     for index in 0..record_total {
         if cur.is_empty() {
             break; // truncated record sets are common in mDNS; keep what we have
         }
-        let (name, next) = parse_name(msg, cur.pos(), msg.len())?;
+        // Locate the record with the non-allocating walker first: rtype and
+        // class sit at fixed offsets after the name, so the keep decision
+        // below costs no String build for the records it discards.
+        let name_start = cur.pos();
+        let next = skip_name(msg, name_start, msg.len())?;
         cur = Cursor::at(msg, next)?;
         let rtype = cur.u16_be()?;
-        cur.u16_be()?; // class / cache-flush bit
+        let class = cur.u16_be()?;
         cur.u32_be()?; // ttl
         let rd_len = usize::from(cur.u16_be()?);
         let rdata_start = cur.pos();
         let rdata = cur.take(rd_len)?;
 
         // Answers and additionals carry naming evidence; authority does not.
-        let keep = index < an_count || index >= an_count.saturating_add(ns_count);
+        // Nor do EDNS OPT pseudo-records (rtype 41, whose "class" is a UDP
+        // size) or non-IN classes — the top class bit is mDNS cache-flush,
+        // not part of the class number.
+        let keep = (index < an_count || index >= an_count.saturating_add(ns_count))
+            && rtype != 41
+            && class & 0x7FFF == 1;
         if !keep {
+            continue;
+        }
+        if !detail {
+            skip_rdata_names(msg, rtype, rdata, rdata_start, rd_len)?;
             continue;
         }
 
@@ -153,10 +190,45 @@ fn parse_inner(msg: &[u8], is_mdns: bool) -> Result<DnsSummary, DecodeError> {
             }
             rtype => DnsRData::Other { rtype },
         };
+        // The skip above proved the owner name walks clean, so this rebuild
+        // cannot fail — only kept records pay the String.
+        let name = parse_name(msg, name_start, msg.len())?.0;
         summary.answers.push(DnsAnswer { name, data });
     }
 
     Ok(summary)
+}
+
+/// The validation-only twin of the detail arms in [`parse_inner`]'s record
+/// loop: walk the rdata names with the same bounds, building nothing — a
+/// message the full parse rejects must be rejected (and stay unlabeled) in
+/// shallow mode too. A/AAAA rdata is fixed-size and already bounds-checked
+/// by the caller's `take`; only the name-bearing types can fail.
+fn skip_rdata_names(
+    msg: &[u8],
+    rtype: u16,
+    rdata: &[u8],
+    rdata_start: usize,
+    rd_len: usize,
+) -> Result<(), DecodeError> {
+    match rtype {
+        TYPE_CNAME | TYPE_PTR => {
+            skip_name(msg, rdata_start, rdata_start.saturating_add(rd_len))?;
+        }
+        TYPE_SRV => {
+            let mut rd = Cursor::new(rdata);
+            rd.u16_be()?; // priority
+            rd.u16_be()?; // weight
+            rd.u16_be()?; // port
+            skip_name(
+                msg,
+                rdata_start.saturating_add(6),
+                rdata_start.saturating_add(rd_len),
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Decompress a domain name starting at `start`. Returns the name and the
@@ -175,6 +247,31 @@ fn parse_name(
     literal_end: usize,
 ) -> Result<(String, usize), DecodeError> {
     let mut name = String::new();
+    let next = walk_name(msg, start, literal_end, Some(&mut name))?;
+    Ok((name, next))
+}
+
+/// [`parse_name`] without the `String`: the identical walk — same loop,
+/// pointer, and length bounds (the assembled length is still tracked against
+/// the 253-byte cap) — but zero allocation. For callers that validate or
+/// locate a name they will not keep.
+fn skip_name(msg: &[u8], start: usize, literal_end: usize) -> Result<usize, DecodeError> {
+    walk_name(msg, start, literal_end, None)
+}
+
+/// The one decompression walker behind [`parse_name`] and [`skip_name`] —
+/// one loop, so the allocating and validation-only paths cannot drift apart.
+fn walk_name(
+    msg: &[u8],
+    start: usize,
+    literal_end: usize,
+    mut sink: Option<&mut String>,
+) -> Result<usize, DecodeError> {
+    // Assembled length (label bytes plus separating dots). Every kept char is
+    // one byte ('?' replaces non-printables), so this tracks exactly what the
+    // built String's `len()` would be — the cap bites identically with or
+    // without a sink.
+    let mut name_len = 0usize;
     let mut pos = start;
     let mut next_after = None; // set at the first pointer jump
     let mut jumps = 0u8;
@@ -189,6 +286,12 @@ fn parse_name(
 
         match len & 0xC0 {
             0xC0 => {
+                // Both pointer bytes must lie within the current bound —
+                // without this, the second byte could be read one past a
+                // record's declared RDATA end.
+                if pos.saturating_add(1) >= bound {
+                    return Err(DecodeError::malformed("dns", "name runs past its record"));
+                }
                 let low = cur.u8()?;
                 let target = usize::from(len & 0x3F) << 8 | usize::from(low);
                 // Pointers must go strictly backwards — kills loops outright.
@@ -213,26 +316,33 @@ fn parse_name(
             0x00 => {
                 if len == 0 {
                     // Root label: name complete.
-                    let after = next_after.unwrap_or(cur.pos());
-                    return Ok((name, after));
+                    return Ok(next_after.unwrap_or(cur.pos()));
                 }
                 // A literal label must lie wholly within the current bound.
                 if cur.pos().saturating_add(usize::from(len)) > bound {
                     return Err(DecodeError::malformed("dns", "label runs past its record"));
                 }
                 let label = cur.take(usize::from(len))?;
-                if name.len().saturating_add(usize::from(len)) > MAX_NAME_LEN {
+                // Count the separating dot too, so the assembled name really
+                // is capped at 253 — not 254 by an off-by-one.
+                let sep = usize::from(name_len > 0);
+                name_len = name_len
+                    .saturating_add(sep)
+                    .saturating_add(usize::from(len));
+                if name_len > MAX_NAME_LEN {
                     return Err(DecodeError::malformed("dns", "name too long"));
                 }
-                if !name.is_empty() {
-                    name.push('.');
-                }
-                // Printable ASCII passthrough; anything else escaped.
-                for &byte in label {
-                    if byte.is_ascii_graphic() && byte != b'.' {
-                        name.push(char::from(byte));
-                    } else {
-                        name.push('?');
+                if let Some(name) = sink.as_deref_mut() {
+                    if !name.is_empty() {
+                        name.push('.');
+                    }
+                    // Printable ASCII passthrough; anything else escaped.
+                    for &byte in label {
+                        if byte.is_ascii_graphic() && byte != b'.' {
+                            name.push(char::from(byte));
+                        } else {
+                            name.push('?');
+                        }
                     }
                 }
                 pos = cur.pos();
@@ -281,6 +391,48 @@ mod tests {
     }
 
     #[test]
+    fn oversized_record_count_keeps_what_we_have() {
+        // Header claims 500 answers; only two are actually present. The old
+        // behavior rejected the whole message ("implausible record count"),
+        // losing both real records.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0x1234u16.to_be_bytes()); // id
+        msg.extend_from_slice(&0x8400u16.to_be_bytes()); // response flags
+        msg.extend_from_slice(&0u16.to_be_bytes()); // qd
+        msg.extend_from_slice(&500u16.to_be_bytes()); // an: a lie
+        msg.extend_from_slice(&0u16.to_be_bytes()); // ns
+        msg.extend_from_slice(&0u16.to_be_bytes()); // ar
+        for ip in [[10, 0, 0, 1], [10, 0, 0, 2]] {
+            msg.extend_from_slice(&[1, b'a', 5, b'l', b'o', b'c', b'a', b'l', 0]);
+            msg.extend_from_slice(&1u16.to_be_bytes()); // A
+            msg.extend_from_slice(&1u16.to_be_bytes()); // IN
+            msg.extend_from_slice(&120u32.to_be_bytes()); // ttl
+            msg.extend_from_slice(&4u16.to_be_bytes()); // rd_len
+            msg.extend_from_slice(&ip);
+        }
+        let summary = parse(&msg, false).unwrap();
+        assert_eq!(summary.answers.len(), 2, "real records must survive");
+    }
+
+    #[test]
+    fn oversized_question_count_keeps_the_cap() {
+        // 100 questions: the first MAX_QUESTIONS are kept, the message is
+        // not rejected.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0x4242u16.to_be_bytes());
+        msg.extend_from_slice(&0u16.to_be_bytes()); // query flags
+        msg.extend_from_slice(&100u16.to_be_bytes()); // qd
+        msg.extend_from_slice(&[0u8; 6]); // an, ns, ar
+        for _ in 0..100 {
+            msg.extend_from_slice(&[1, b'q', 0]); // "q."
+            msg.extend_from_slice(&1u16.to_be_bytes());
+            msg.extend_from_slice(&1u16.to_be_bytes());
+        }
+        let summary = parse(&msg, false).unwrap();
+        assert_eq!(summary.queries.len(), usize::from(MAX_QUESTIONS));
+    }
+
+    #[test]
     fn rejects_pointer_loop() {
         let mut msg = sample_response();
         // Make the answer's pointer point at itself (offset 29 = 0xC0 0x1D).
@@ -299,6 +451,49 @@ mod tests {
         msg[4] = 0xFF;
         msg[5] = 0xFF;
         assert!(parse(&msg, false).is_none());
+    }
+
+    #[test]
+    fn shallow_parse_agrees_with_full() {
+        // Accept side: same verdict and header facts, no detail materialized.
+        let msg = sample_response();
+        let full = parse(&msg, false).unwrap();
+        let shallow = parse_shallow(&msg, false).unwrap();
+        assert_eq!(shallow.id, full.id);
+        assert_eq!(shallow.is_response, full.is_response);
+        assert_eq!(shallow.is_mdns, full.is_mdns);
+        assert!(shallow.queries.is_empty() && shallow.answers.is_empty());
+
+        // Reject side: every full-parse rejection must reject shallow too,
+        // or flows/summary would label packets the detail consumers drop.
+        let mut looped = sample_response();
+        let ptr_at = 12 + 17;
+        looped[ptr_at] = 0xC0;
+        looped[ptr_at + 1] = u8::try_from(ptr_at).unwrap();
+        assert!(parse_shallow(&looped, false).is_none());
+        assert!(parse_shallow(&[0x00; 4], false).is_none());
+        assert!(parse_shallow(&[], false).is_none());
+    }
+
+    /// A kept record whose RDATA is too short for its fixed SRV fields makes
+    /// the full parse reject the message — the validation-only walk must
+    /// agree even though it materializes nothing.
+    #[test]
+    fn shallow_parse_validates_rdata_too() {
+        let mut msg = vec![
+            0x00, 0x01, // id
+            0x84, 0x00, // QR, AA
+            0x00, 0x00, // 0 questions
+            0x00, 0x01, // 1 answer
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        msg.extend_from_slice(b"\x04_srv\x05local\x00");
+        msg.extend_from_slice(&[0x00, 33, 0x00, 0x01]); // type SRV, class IN
+        msg.extend_from_slice(&[0, 0, 0, 60]); // ttl
+        msg.extend_from_slice(&[0x00, 0x02]); // rd_len = 2: u16 reads run out
+        msg.extend_from_slice(&[0x00, 0x00]);
+        assert!(parse(&msg, true).is_none());
+        assert!(parse_shallow(&msg, true).is_none());
     }
 
     /// An SRV answer whose `rd_len` is 6 (priority+weight+port, no target) must

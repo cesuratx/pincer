@@ -89,8 +89,12 @@ impl State {
         let mut cur = Cursor::new(&header);
         let ts_sec = self.u32(&mut cur)?;
         let ts_frac = self.u32(&mut cur)?;
-        let incl_len = self.u32(&mut cur)? as usize;
-        let orig_len = self.u32(&mut cur)?;
+        let incl_len_u32 = self.u32(&mut cur)?;
+        let incl_len = incl_len_u32 as usize;
+        // incl_len > orig_len is a writer lie: the captured bytes are real, so
+        // the wire length is at least the captured length. Normalizing here is
+        // what makes decode's truncation test (cap_len < orig_len) trustworthy.
+        let orig_len = self.u32(&mut cur)?.max(incl_len_u32);
 
         if incl_len > MAX_RECORD_LEN {
             return Err(PcapError::BadLength {
@@ -111,6 +115,9 @@ impl State {
         *offset = offset.saturating_add(16).saturating_add(incl_len as u64);
 
         // Lenient on out-of-range fractions: normalize rather than abort.
+        // Deliberately uncounted — the value is recoverable noise, unlike a
+        // malformed block, and the reader's only anomaly channel (skipped
+        // blocks) would overstate it as data loss.
         let nanos = if self.nanos {
             ts_frac.checked_rem(1_000_000_000).unwrap_or(0)
         } else {
@@ -121,7 +128,7 @@ impl State {
         };
 
         Ok(Some(Record {
-            ts: Timestamp::new(u64::from(ts_sec), nanos),
+            ts: Some(Timestamp::new(u64::from(ts_sec), nanos)),
             orig_len,
             link_type: self.link_type,
             data: buf.get(..incl_len).unwrap_or(&[]),

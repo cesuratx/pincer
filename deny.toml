@@ -1,0 +1,31 @@
+# cargo-deny policy — enforced by .github/workflows/audit.yml.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+# Everything in the current tree is satisfiable from this list. Crates with
+# OR expressions (e.g. "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+# "MIT OR Apache-2.0 OR LGPL-2.1-or-later") are covered by the MIT arm;
+# unicode-ident is "(MIT OR Apache-2.0) AND Unicode-3.0". A new license in the
+# tree fails CI until it is deliberately added here.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+]
+
+[bans]
+# Duplicate versions are common in the dev-dependency tree (proptest pulls a
+# wide graph); warn rather than block, but never allow wildcard requirements.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

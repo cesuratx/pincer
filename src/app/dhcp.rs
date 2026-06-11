@@ -81,6 +81,10 @@ pub struct DhcpSummary {
     /// Option 1 — the subnet mask the server hands out (OFFER/ACK). Lets the
     /// asset inventory learn the *real* local segment size, not a /24 guess.
     pub subnet_mask: Option<Ipv4Addr>,
+    /// `giaddr` — set when a relay forwarded this exchange from *another*
+    /// segment: the client MAC and subnet then describe an off-link network,
+    /// not the captured one.
+    pub relay_ip: Option<Ipv4Addr>,
     pub hostname: Option<String>,
     pub vendor_class: Option<String>,
     /// Option 55 codes in request order — the device fingerprint.
@@ -99,10 +103,19 @@ impl DhcpSummary {
 /// Parse a DHCP message. `None` = does not look like DHCP.
 #[must_use]
 pub fn parse(payload: &[u8]) -> Option<DhcpSummary> {
-    parse_inner(payload).ok()
+    parse_inner(payload, true).ok()
 }
 
-fn parse_inner(payload: &[u8]) -> Result<DhcpSummary, DecodeError> {
+/// Validation-only parse for label-level consumers (`flows`, `summary`):
+/// identical accept/reject to [`parse`] — same header checks, same option
+/// walk — but the owned hostname/vendor-class/fingerprint detail is not
+/// materialized.
+#[must_use]
+pub fn parse_shallow(payload: &[u8]) -> Option<DhcpSummary> {
+    parse_inner(payload, false).ok()
+}
+
+fn parse_inner(payload: &[u8], detail: bool) -> Result<DhcpSummary, DecodeError> {
     let mut cur = Cursor::new(payload);
     let op = cur.u8()?;
     if op != 1 && op != 2 {
@@ -120,7 +133,7 @@ fn parse_inner(payload: &[u8]) -> Result<DhcpSummary, DecodeError> {
     cur.ipv4()?; // ciaddr
     let yiaddr = cur.ipv4()?;
     cur.ipv4()?; // siaddr
-    cur.ipv4()?; // giaddr
+    let giaddr = cur.ipv4()?;
     let client_mac = cur.mac()?;
     cur.skip(10)?; // rest of chaddr
     cur.skip(64)?; // sname
@@ -137,6 +150,7 @@ fn parse_inner(payload: &[u8]) -> Result<DhcpSummary, DecodeError> {
         requested_ip: None,
         server_id: None,
         subnet_mask: None,
+        relay_ip: (!giaddr.is_unspecified()).then_some(giaddr),
         hostname: None,
         vendor_class: None,
         param_req_list: Vec::new(),
@@ -158,12 +172,14 @@ fn parse_inner(payload: &[u8]) -> Result<DhcpSummary, DecodeError> {
                 summary.msg_type = DhcpMsgType::from(val.u8()?);
                 saw_msg_type = true;
             }
-            OPT_HOSTNAME => summary.hostname = Some(printable(value)),
-            OPT_VENDOR_CLASS => summary.vendor_class = Some(printable(value)),
+            // The owned-detail options allocate; label-only callers skip the
+            // build (the walk and every validating read stay unchanged).
+            OPT_HOSTNAME if detail => summary.hostname = Some(printable(value)),
+            OPT_VENDOR_CLASS if detail => summary.vendor_class = Some(printable(value)),
             OPT_SUBNET_MASK if len == 4 => summary.subnet_mask = Some(val.ipv4()?),
             OPT_REQUESTED_IP if len == 4 => summary.requested_ip = Some(val.ipv4()?),
             OPT_SERVER_ID if len == 4 => summary.server_id = Some(val.ipv4()?),
-            OPT_PARAM_LIST => summary.param_req_list = value.to_vec(),
+            OPT_PARAM_LIST if detail => summary.param_req_list = value.to_vec(),
             _ => {}
         }
     }
@@ -174,6 +190,8 @@ fn parse_inner(payload: &[u8]) -> Result<DhcpSummary, DecodeError> {
     Ok(summary)
 }
 
+/// Like `app::sanitize_name`, plus the space character — DHCP option values
+/// (vendor class "MSFT 5.0") legitimately contain one; hostnames do not.
 fn printable(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -222,6 +240,24 @@ mod tests {
         assert_eq!(summary.hostname.as_deref(), Some("carols-laptop"));
         assert_eq!(summary.fingerprint(), "1,3,6,15,119");
         assert!(summary.your_ip.is_none());
+    }
+
+    #[test]
+    fn shallow_parse_agrees_with_full() {
+        let mac = MacAddr([0x3C, 0x22, 0xFB, 1, 2, 3]);
+        let msg = discover(mac, "carols-laptop", &[1, 3, 6]);
+        let full = parse(&msg).unwrap();
+        let shallow = parse_shallow(&msg).unwrap();
+        assert_eq!(shallow.msg_type, full.msg_type);
+        assert_eq!(shallow.client_mac, full.client_mac);
+        assert_eq!(shallow.xid, full.xid);
+        // Label-only mode materializes none of the owned detail.
+        assert!(shallow.hostname.is_none());
+        assert!(shallow.vendor_class.is_none());
+        assert!(shallow.param_req_list.is_empty());
+        // Reject side must agree too.
+        assert!(parse_shallow(&[]).is_none());
+        assert!(parse_shallow(&[0xFF; 300]).is_none());
     }
 
     #[test]

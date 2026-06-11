@@ -21,10 +21,18 @@ pub use tls::TlsClientHello;
 
 use crate::decode::{PacketView, TransportView};
 
+/// Longest name accepted as hostname evidence — the RFC 1035 limit. A TLS SNI
+/// or HTTP Host longer than this is not a real hostname; dropping it (rather
+/// than storing it) keeps per-flow/per-asset memory byte-bounded, not just
+/// entry-bounded.
+pub(crate) const MAX_NAME_LEN: usize = 253;
+
 /// Replace any non-graphic byte in an attacker-controlled name with `?`. Used
-/// for TLS SNI and HTTP Host, matching how DNS and DHCP names are sanitized at
-/// the source — so a hostname carrying ANSI escape bytes can never reach the
-/// operator's terminal (or a DOT/table cell) unescaped.
+/// for TLS SNI and HTTP Host/path, matching how DNS names are sanitized at the
+/// source — so a string carrying ANSI escape bytes can never reach the
+/// operator's terminal (or a DOT/table cell) unescaped. (DHCP's `printable`
+/// additionally permits the space character: vendor-class strings like
+/// `MSFT 5.0` carry one legitimately.)
 #[must_use]
 pub(crate) fn sanitize_name(raw: &str) -> String {
     // `is_ascii_graphic` keeps letters, digits, and `.-_` (every legitimate
@@ -73,19 +81,65 @@ const PORT_DHCP_CLIENT: u16 = 68;
 const PORT_MDNS: u16 = 5353;
 const PORT_LLMNR: u16 = 5355;
 
-/// Try to extract an application event from a decoded packet.
+/// How much app-event detail the caller's sinks will consume. `flows` and
+/// `summary` read only [`AppEvent::label`] (and [`AppEvent::server_name_hint`],
+/// which DNS/DHCP events never carry), so for them the DNS/DHCP sniffers run
+/// validation-only: same accept/reject, same label, none of the per-record
+/// allocations a hostile mDNS flood would otherwise extract. Detail must stay
+/// on for any sink that reads queries, answers, or DHCP options (`assets`,
+/// `dns`, `dhcp`).
+#[derive(Debug, Clone, Copy)]
+pub struct SniffDepth {
+    /// Materialize DNS query/answer detail.
+    pub dns_detail: bool,
+    /// Materialize DHCP hostname/vendor/fingerprint detail.
+    pub dhcp_detail: bool,
+}
+
+impl SniffDepth {
+    /// Full detail for every protocol.
+    pub const FULL: Self = Self {
+        dns_detail: true,
+        dhcp_detail: true,
+    };
+}
+
+/// Try to extract an application event from a decoded packet (full detail).
 #[must_use]
 pub fn sniff(pkt: &PacketView<'_>) -> Option<AppEvent> {
+    sniff_with(pkt, SniffDepth::FULL)
+}
+
+/// [`sniff`] with a depth hint: label-only consumers skip the allocating
+/// DNS/DHCP detail builds without changing which packets get labeled.
+#[must_use]
+pub fn sniff_with(pkt: &PacketView<'_>, depth: SniffDepth) -> Option<AppEvent> {
     match pkt.transport.as_ref()? {
         TransportView::Udp(udp) => {
             let ports = (udp.src_port, udp.dst_port);
             let port_match = |port| ports.0 == port || ports.1 == port;
+            let parse_dns = |is_mdns| {
+                if depth.dns_detail {
+                    dns::parse(udp.payload, is_mdns)
+                } else {
+                    dns::parse_shallow(udp.payload, is_mdns)
+                }
+                .map(AppEvent::Dns)
+            };
             if port_match(PORT_DNS) {
-                dns::parse(udp.payload, false).map(AppEvent::Dns)
+                parse_dns(false)
+            // LLMNR shares the DNS wire format and multicast name-resolution
+            // semantics; its events are deliberately folded under the "mdns"
+            // label rather than given a fourth protocol bucket.
             } else if port_match(PORT_MDNS) || port_match(PORT_LLMNR) {
-                dns::parse(udp.payload, true).map(AppEvent::Dns)
+                parse_dns(true)
             } else if port_match(PORT_DHCP_SERVER) || port_match(PORT_DHCP_CLIENT) {
-                dhcp::parse(udp.payload).map(AppEvent::Dhcp)
+                if depth.dhcp_detail {
+                    dhcp::parse(udp.payload)
+                } else {
+                    dhcp::parse_shallow(udp.payload)
+                }
+                .map(AppEvent::Dhcp)
             } else {
                 None
             }

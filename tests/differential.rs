@@ -19,7 +19,7 @@ use pincer::types::{MacAddr, Timestamp};
 
 fn record(frame: &[u8]) -> Record<'_> {
     Record {
-        ts: Timestamp::ZERO,
+        ts: Some(Timestamp::ZERO),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: frame,
@@ -62,10 +62,15 @@ fn assert_agrees(frame: &[u8]) {
                 our_tcp.flags.contains(pincer::decode::TcpFlags::FIN),
                 their_tcp.fin()
             );
+            assert_eq!(our_tcp.window, their_tcp.window_size());
+            // Payload boundary is what HTTP/TLS sniffing reads from — any
+            // disagreement on where options end would poison everything above.
+            assert_eq!(our_tcp.payload, their_tcp.payload(), "TCP payload boundary");
         }
         (Some(TransportView::Udp(our_udp)), Some(TransportSlice::Udp(their_udp))) => {
             assert_eq!(our_udp.src_port, their_udp.source_port());
             assert_eq!(our_udp.dst_port, their_udp.destination_port());
+            assert_eq!(our_udp.payload, their_udp.payload(), "UDP payload boundary");
         }
         (ours, theirs) => panic!("transport layer disagreement: {ours:?} vs {theirs:?}"),
     }

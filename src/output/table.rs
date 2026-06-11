@@ -29,6 +29,9 @@ impl Table {
         }
     }
 
+    /// Append a row. Contract: the caller supplies exactly one cell per header
+    /// column — a mismatched arity renders misaligned rather than panicking
+    /// (no panics in library code).
     pub fn push(&mut self, row: Vec<String>) {
         self.rows.push(row);
     }

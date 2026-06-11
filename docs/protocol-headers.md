@@ -15,7 +15,7 @@ order (big-endian).
 EtherTypes: `0x0800` IPv4, `0x0806` ARP, `0x86DD` IPv6, `0x8100` 802.1Q VLAN,
 `0x88A8`/`0x9100` QinQ. A VLAN tag is 4 bytes: 2-byte TPID (the `0x8100`-class
 value, already read as EtherType) + 2-byte TCI; the low 12 bits of the TCI are
-the VLAN ID. Tags stack (QinQ); loop until the EtherType is non-VLAN. The first
+the VLAN ID. Tags stack (QinQ); loop until the EtherType is non-VLAN (pincer caps the stack at four tags and degrades — MACs survive — beyond that). The first
 octet's low bit (`& 0x01`) marks a multicast/broadcast destination.
 
 ## ARP (28 bytes for IPv4-over-Ethernet)

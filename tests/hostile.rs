@@ -16,7 +16,7 @@ use pincer::types::{MacAddr, Timestamp};
 
 fn decode_observe<O: Observe>(sink: &mut O, frame: &[u8]) {
     let record = Record {
-        ts: Timestamp::ZERO,
+        ts: Some(Timestamp::ZERO),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: frame,
@@ -210,6 +210,41 @@ fn normal_traffic_never_triggers_caps() {
     assert!(!assets.overflow().any());
 }
 
+/// One MAC spraying fresh IPv6 link-local *sources* — local by definition,
+/// with no subnet learning and no ARP/DHCP needed — must not grow its single
+/// asset's IP set with the streamed file. `max_bindings` does not bound this
+/// path: `record_local_host` runs even when `bind()` dropped at its cap, so
+/// the per-asset `max_ips_per_asset` cap has to hold on its own.
+#[test]
+fn ipv6_link_local_source_flood_respects_per_asset_ip_cap() {
+    let mut assets = AssetInventory::with_limits(Limits::tiny()); // max_ips_per_asset = 4
+    let mac = MacAddr([2, 0, 0, 0, 0, 0x66]);
+    for i in 0u16..200 {
+        let frame = Packet::ethernet(mac, MacAddr([0x33, 0x33, 0, 0, 0, 1]))
+            .ipv6(
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, i),
+                Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1),
+            )
+            .udp(40000, 40001)
+            .payload(b"x");
+        decode_observe(&mut assets, &frame);
+    }
+    let asset = assets
+        .assets()
+        .into_iter()
+        .find(|a| a.macs.contains(&mac))
+        .expect("flooded asset exists");
+    assert!(
+        asset.ips.len() <= 4,
+        "per-asset IP set must respect its cap, got {}",
+        asset.ips.len()
+    );
+    assert!(
+        assets.overflow().ips > 0,
+        "ip-cap drops must be counted, not silent"
+    );
+}
+
 /// An IPv6 random-flow flood must also stay bounded (the v6 path is separate).
 #[test]
 fn ipv6_flow_flood_respects_cap() {
@@ -227,4 +262,649 @@ fn ipv6_flow_flood_respects_cap() {
         decode_observe(&mut flows, &frame);
     }
     assert_eq!(flows.len(), 8);
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial *container* tests: pcapng framing attacks. The block-length
+// field drives buffer sizing and stream advancement, so lies here are how a
+// hostile file tries to hang the reader, force a giant allocation, or
+// silently truncate the analysis.
+// ---------------------------------------------------------------------------
+
+mod pcapng_hostile {
+    use pincer::error::PcapError;
+    use pincer::pcap::CaptureReader;
+
+    /// Minimal little-endian SHB (28 bytes, no options).
+    fn shb_le() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&(-1i64).to_le_bytes());
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b
+    }
+
+    /// A block whose header *claims* `total_len`, regardless of the body.
+    fn lying_block(block_type: u32, total_len: u32, body: &[u8]) -> Vec<u8> {
+        let mut b = block_type.to_le_bytes().to_vec();
+        b.extend_from_slice(&total_len.to_le_bytes());
+        b.extend_from_slice(body);
+        b
+    }
+
+    #[test]
+    fn block_length_lies_are_rejected_not_hung() {
+        // 0 and 4 would make the stream go backwards; 8 and 11 are below the
+        // 12-byte framing minimum; 13 and 14 break 4-alignment. Every one
+        // must be a BadLength error — not an infinite loop, not a panic, and
+        // not a silent EOF.
+        for lie in [0u32, 4, 8, 11, 13, 14] {
+            let mut file = shb_le();
+            file.extend_from_slice(&lying_block(6, lie, &[0u8; 64]));
+            let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+            let err = reader.next_record().expect_err("length lie must error");
+            assert!(
+                matches!(err, PcapError::BadLength { len, .. } if len == u64::from(lie)),
+                "total_len {lie}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn giant_block_length_is_rejected_without_allocation() {
+        // 4-aligned and well-formed framing, but claims a ~4 GiB body. The
+        // 64 MiB record cap must reject it before any buffer is sized by it.
+        let mut file = shb_le();
+        file.extend_from_slice(&lying_block(6, 0xFFFF_FFF0, &[0u8; 16]));
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let err = reader.next_record().expect_err("giant length must error");
+        assert!(matches!(err, PcapError::BadLength { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn truncated_mid_block_is_truncation_not_panic() {
+        // A block header promising more bytes than the file has: the typical
+        // cut-off-mid-write capture. Must surface as TruncatedFile so the
+        // caller can flag the tail, never a panic or a hang.
+        let mut file = shb_le();
+        file.extend_from_slice(&lying_block(6, 64, &[0u8; 10])); // 42 bytes short
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let err = reader.next_record().expect_err("must error");
+        assert!(
+            matches!(err, PcapError::TruncatedFile { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn big_endian_section_parses() {
+        // Endianness comes from the BOM per section; a big-endian file is
+        // valid input, not an anomaly.
+        let mut file = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        file.extend_from_slice(&28u32.to_be_bytes());
+        file.extend_from_slice(&0x1A2B_3C4Du32.to_be_bytes());
+        file.extend_from_slice(&1u16.to_be_bytes());
+        file.extend_from_slice(&0u16.to_be_bytes());
+        file.extend_from_slice(&(-1i64).to_be_bytes());
+        file.extend_from_slice(&28u32.to_be_bytes());
+        // IDB: Ethernet, snaplen 0.
+        file.extend_from_slice(&1u32.to_be_bytes());
+        file.extend_from_slice(&20u32.to_be_bytes());
+        file.extend_from_slice(&1u16.to_be_bytes());
+        file.extend_from_slice(&0u16.to_be_bytes());
+        file.extend_from_slice(&0u32.to_be_bytes());
+        file.extend_from_slice(&20u32.to_be_bytes());
+        // EPB with 4 data bytes.
+        file.extend_from_slice(&6u32.to_be_bytes());
+        file.extend_from_slice(&36u32.to_be_bytes());
+        for field in [0u32, 0, 0, 4, 4] {
+            file.extend_from_slice(&field.to_be_bytes());
+        }
+        file.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        file.extend_from_slice(&36u32.to_be_bytes());
+
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let record = reader.next_record().unwrap().expect("one packet");
+        assert_eq!(record.data, &[0xCA, 0xFE, 0xBA, 0xBE]);
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn idb_option_length_lie_does_not_hang_or_poison_the_section() {
+        // IDB whose if_tsresol option claims 0xFFFF value bytes that are not
+        // there. Option walking must stop; the packet block after it must
+        // still decode under the interface's defaults.
+        let mut file = shb_le();
+        let mut idb_body = Vec::new();
+        idb_body.extend_from_slice(&1u16.to_le_bytes()); // Ethernet
+        idb_body.extend_from_slice(&0u16.to_le_bytes());
+        idb_body.extend_from_slice(&0u32.to_le_bytes()); // snaplen: no limit
+        idb_body.extend_from_slice(&9u16.to_le_bytes()); // if_tsresol
+        idb_body.extend_from_slice(&0xFFFFu16.to_le_bytes()); // length lie
+        let total = u32::try_from(idb_body.len()).unwrap() + 12;
+        file.extend_from_slice(&1u32.to_le_bytes());
+        file.extend_from_slice(&total.to_le_bytes());
+        file.extend_from_slice(&idb_body);
+        file.extend_from_slice(&total.to_le_bytes());
+        // Valid EPB.
+        file.extend_from_slice(&6u32.to_le_bytes());
+        file.extend_from_slice(&36u32.to_le_bytes());
+        for field in [0u32, 0, 0, 4, 4] {
+            file.extend_from_slice(&field.to_le_bytes());
+        }
+        file.extend_from_slice(&[1, 2, 3, 4]);
+        file.extend_from_slice(&36u32.to_le_bytes());
+
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let record = reader.next_record().unwrap().expect("EPB must survive");
+        assert_eq!(record.data, &[1, 2, 3, 4]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SPB timestamp integrity: a Simple Packet Block carries NO timestamp. The
+// reader must surface that absence (never fabricate the 1970 epoch), the
+// sinks must exclude such records from every first/last fold, and the
+// degradation channel — stderr, summary note, JSON envelope — must count
+// them. A forensic timeline silently anchored at 1970 is falsified evidence.
+// ---------------------------------------------------------------------------
+
+mod spb_timestamps {
+    use std::net::Ipv4Addr;
+    use std::process::{Command, Output};
+
+    use pincer::pcap::CaptureReader;
+    use pincer::types::MacAddr;
+
+    fn shb_le() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&(-1i64).to_le_bytes());
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b
+    }
+
+    fn idb_le() -> Vec<u8> {
+        let mut b = 1u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b
+    }
+
+    /// EPB stamped at `ticks` µs since the epoch (the IDB default resolution).
+    fn epb_le(ticks: u64, data: &[u8]) -> Vec<u8> {
+        let cap = u32::try_from(data.len()).unwrap();
+        let padded = data.len().next_multiple_of(4);
+        let total = u32::try_from(32 + padded).unwrap();
+        let mut b = 6u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&total.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // interface_id
+        b.extend_from_slice(&u32::try_from(ticks >> 32).unwrap().to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        b.extend_from_slice(&(ticks as u32).to_le_bytes());
+        b.extend_from_slice(&cap.to_le_bytes());
+        b.extend_from_slice(&cap.to_le_bytes());
+        b.extend_from_slice(data);
+        b.resize(b.len() + (padded - data.len()), 0);
+        b.extend_from_slice(&total.to_le_bytes());
+        b
+    }
+
+    /// SPB: original length, then data padded to 4 bytes — no timestamp field.
+    fn spb_le(data: &[u8]) -> Vec<u8> {
+        let padded = data.len().next_multiple_of(4);
+        let total = u32::try_from(16 + padded).unwrap();
+        let mut b = 3u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&total.to_le_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+        b.extend_from_slice(data);
+        b.resize(b.len() + (padded - data.len()), 0);
+        b.extend_from_slice(&total.to_le_bytes());
+        b
+    }
+
+    /// A decodable UDP frame so the analysis sinks actually fold the record.
+    fn udp_frame(src_port: u16) -> Vec<u8> {
+        pincer::fixtures::Packet::ethernet(MacAddr([2, 0, 0, 0, 0, 1]), MacAddr([2, 0, 0, 0, 0, 2]))
+            .ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2))
+            .udp(src_port, 53)
+            .payload(b"x")
+    }
+
+    /// Write a capture to a temp file and run the real binary on it.
+    fn run_on(tag: &str, capture: &[u8], args: &[&str]) -> Output {
+        let path = std::env::temp_dir().join(format!("pincer-{tag}-{}.pcapng", std::process::id()));
+        std::fs::write(&path, capture).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_pincer"))
+            .args(args)
+            .arg(&path)
+            .output()
+            .expect("binary must run");
+        std::fs::remove_file(&path).ok();
+        out
+    }
+
+    /// The reader carries timestamp absence in the type and counts it — it
+    /// never invents an epoch value for a block that has no timestamp field.
+    #[test]
+    fn spb_records_surface_timestamp_absence() {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        file.extend_from_slice(&spb_le(&udp_frame(40000)));
+        file.extend_from_slice(&spb_le(&udp_frame(40001)));
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        for _ in 0..2 {
+            let rec = reader.next_record().unwrap().expect("SPB record");
+            assert_eq!(rec.ts, None, "an SPB has no timestamp to report");
+        }
+        assert!(reader.next_record().unwrap().is_none());
+        assert_eq!(reader.timestampless_records(), 2, "absence must be counted");
+    }
+
+    /// A pure-SPB capture must report honest absence — null times, zero
+    /// duration, a degradation count, exit 0 — and never a 1970 date.
+    #[test]
+    fn pure_spb_capture_reports_no_epoch_dates() {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        file.extend_from_slice(&spb_le(&udp_frame(40000)));
+        file.extend_from_slice(&spb_le(&udp_frame(40001)));
+
+        let out = run_on("pure-spb-json", &file, &["summary", "--json"]);
+        assert!(out.status.success(), "degraded is not broken: exit 0");
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let data = json.get("data").unwrap();
+        assert!(
+            data.get("first_ts").unwrap().is_null(),
+            "no fabricated start"
+        );
+        assert!(data.get("last_ts").unwrap().is_null(), "no fabricated end");
+        assert_eq!(data.get("duration_secs").unwrap().as_f64(), Some(0.0));
+        assert_eq!(
+            data.pointer("/anomalies/timestampless")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            json.pointer("/degradation/timestampless_records")
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "the envelope must say the timeline is missing"
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !stdout.contains("1970"),
+            "no epoch dates anywhere: {stdout}"
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("no timestamp"),
+            "stderr must warn about the missing timeline: {stderr}"
+        );
+
+        let out = run_on("pure-spb-table", &file, &["summary"]);
+        assert!(out.status.success());
+        let table = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !table.contains("1970"),
+            "no epoch dates in the table: {table}"
+        );
+        assert!(
+            table.contains("carry no timestamp"),
+            "the table must note the missing timeline: {table}"
+        );
+
+        // Flows built only from SPB records have no honest times either.
+        let out = run_on("pure-spb-flows", &file, &["flows", "--json"]);
+        assert!(out.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let flow = json.pointer("/data/0").expect("one flow");
+        assert!(flow.get("first_ts").unwrap().is_null());
+        assert!(flow.get("last_ts").unwrap().is_null());
+        assert!(!String::from_utf8(out.stdout).unwrap().contains("1970"));
+    }
+
+    /// Mixing EPBs (real clock) with SPBs (no clock) must not drag the span
+    /// to the epoch: the audit's 1-EPB+1-SPB capture reported a ~31.7-year
+    /// duration. The duration comes from the timestamped records alone.
+    #[test]
+    fn mixed_epb_spb_does_not_inflate_duration() {
+        let base_us = 1_000_000_000u64 * 1_000_000; // 2001-09-09, in µs ticks
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        file.extend_from_slice(&epb_le(base_us, &udp_frame(40000)));
+        file.extend_from_slice(&spb_le(&udp_frame(40001)));
+        file.extend_from_slice(&epb_le(base_us + 100_000_000, &udp_frame(40002)));
+
+        let out = run_on("mixed-epb-spb", &file, &["summary", "--json"]);
+        assert!(out.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let data = json.get("data").unwrap();
+        let duration = data.get("duration_secs").unwrap().as_f64().unwrap();
+        assert!(
+            (duration - 100.0).abs() < 1e-6,
+            "duration must span the timestamped records only, got {duration}"
+        );
+        assert!(
+            data.get("first_ts")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("2001-"),
+            "first_ts must be the first real timestamp"
+        );
+        assert_eq!(
+            data.get("clock_inconsistent").unwrap().as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            json.pointer("/degradation/timestampless_records")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    /// The >5-year span heuristic must reach JSON consumers, not only the
+    /// table note — and only for genuinely inconsistent capture clocks (two
+    /// EPBs years apart), which SPB zeroing can no longer fake.
+    #[test]
+    fn clock_inconsistency_is_machine_readable() {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        file.extend_from_slice(&epb_le(1_000_000_000u64 * 1_000_000, &udp_frame(40000)));
+        file.extend_from_slice(&epb_le(1_200_000_000u64 * 1_000_000, &udp_frame(40001)));
+
+        let out = run_on("clock-skew-json", &file, &["summary", "--json"]);
+        assert!(out.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            json.pointer("/data/clock_inconsistent")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a years-long span must flag the clock for JSON consumers too"
+        );
+
+        let out = run_on("clock-skew-table", &file, &["summary"]);
+        let table = String::from_utf8(out.stdout).unwrap();
+        assert!(table.contains("exceeds 5 years"), "table keeps its note");
+    }
+}
+
+mod pcapng_framing {
+    use pincer::error::PcapError;
+    use pincer::pcap::CaptureReader;
+
+    fn shb_le() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&(-1i64).to_le_bytes());
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b
+    }
+
+    fn idb_le() -> Vec<u8> {
+        let mut b = 1u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b
+    }
+
+    fn epb_le(iface: u32, data: &[u8]) -> Vec<u8> {
+        let cap = u32::try_from(data.len()).unwrap();
+        let padded = data.len().next_multiple_of(4);
+        let total = u32::try_from(32 + padded).unwrap();
+        let mut b = 6u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&total.to_le_bytes());
+        for field in [iface, 0, 0, cap, cap] {
+            b.extend_from_slice(&field.to_le_bytes());
+        }
+        b.extend_from_slice(data);
+        b.resize(b.len() + (padded - data.len()), 0);
+        b.extend_from_slice(&total.to_le_bytes());
+        b
+    }
+
+    /// A trailing Block Total Length that disagrees with the leading one means
+    /// the framing itself is corrupt — the stream must stop with an error, not
+    /// keep walking on a length it now knows is untrustworthy.
+    #[test]
+    fn trailing_length_mismatch_is_fatal_framing_damage() {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        let mut epb = epb_le(0, &[1, 2, 3, 4]);
+        let n = epb.len();
+        epb.get_mut(n - 4..)
+            .unwrap()
+            .copy_from_slice(&999u32.to_le_bytes()); // corrupt trailer
+        file.extend_from_slice(&epb);
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let err = reader.next_record().expect_err("mismatch must error");
+        assert!(
+            matches!(err, PcapError::BadLength { len: 999, .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// An EPB naming an interface the section never declared must be skipped
+    /// and counted — not silently decoded under a guessed default interface
+    /// (wrong link type, wrong clock).
+    #[test]
+    fn epb_with_undeclared_interface_is_skipped_and_counted() {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le()); // declares interface 0 only
+        file.extend_from_slice(&epb_le(7, &[1, 2, 3, 4])); // references 7
+        file.extend_from_slice(&epb_le(0, &[5, 6, 7, 8])); // valid
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let rec = reader.next_record().unwrap().expect("valid EPB survives");
+        assert_eq!(rec.data, &[5, 6, 7, 8]);
+        assert!(reader.next_record().unwrap().is_none());
+        assert_eq!(reader.skipped_blocks(), 1);
+    }
+
+    /// An IDB flood must not grow memory without bound: past the cap the
+    /// definitions are skipped and counted.
+    #[test]
+    fn idb_flood_is_capped_not_unbounded() {
+        let mut file = shb_le();
+        for _ in 0..5000 {
+            file.extend_from_slice(&idb_le());
+        }
+        file.extend_from_slice(&epb_le(0, &[9, 9, 9, 9]));
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        let rec = reader.next_record().unwrap().expect("packet still decodes");
+        assert_eq!(rec.data, &[9, 9, 9, 9]);
+        assert_eq!(reader.skipped_blocks(), 5000 - 4096, "overflow counted");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mid-stream section damage: a concatenated pcapng whose SECOND section header
+// is corrupt (bad byte-order magic or unknown major version). Everything
+// before it parsed clean — the analysis must keep those packets, set the
+// `damaged_section` degradation flag, and warn on stderr. Only an unreadable
+// FIRST header (nothing trustworthy parsed yet) stays a hard error.
+// ---------------------------------------------------------------------------
+
+mod damaged_sections {
+    use std::net::Ipv4Addr;
+    use std::process::{Command, Output};
+
+    use pincer::types::MacAddr;
+
+    fn shb_le() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&(-1i64).to_le_bytes());
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b
+    }
+
+    fn idb_le() -> Vec<u8> {
+        let mut b = 1u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b
+    }
+
+    fn epb_le(data: &[u8]) -> Vec<u8> {
+        let cap = u32::try_from(data.len()).unwrap();
+        let padded = data.len().next_multiple_of(4);
+        let total = u32::try_from(32 + padded).unwrap();
+        let mut b = 6u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&total.to_le_bytes());
+        for field in [0u32, 0, 0, cap, cap] {
+            b.extend_from_slice(&field.to_le_bytes());
+        }
+        b.extend_from_slice(data);
+        b.resize(b.len() + (padded - data.len()), 0);
+        b.extend_from_slice(&total.to_le_bytes());
+        b
+    }
+
+    /// SHB framing whose byte-order magic is garbage in both endiannesses —
+    /// the 12 corrupt bytes the audit appends to a valid section.
+    fn shb_bad_bom() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        b
+    }
+
+    /// Well-formed SHB declaring major version 2 — a version this reader must
+    /// refuse to guess at.
+    fn shb_le_v2() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&(-1i64).to_le_bytes());
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b
+    }
+
+    fn udp_frame(src_port: u16) -> Vec<u8> {
+        pincer::fixtures::Packet::ethernet(MacAddr([2, 0, 0, 0, 0, 1]), MacAddr([2, 0, 0, 0, 0, 2]))
+            .ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2))
+            .udp(src_port, 53)
+            .payload(b"x")
+    }
+
+    /// One valid section carrying two packets, then a damaged second SHB.
+    fn capture_with_damaged_tail(bad_shb: &[u8]) -> Vec<u8> {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        file.extend_from_slice(&epb_le(&udp_frame(40000)));
+        file.extend_from_slice(&epb_le(&udp_frame(40001)));
+        file.extend_from_slice(bad_shb);
+        file
+    }
+
+    fn run_on(tag: &str, capture: &[u8], args: &[&str]) -> Output {
+        let path = std::env::temp_dir().join(format!("pincer-{tag}-{}.pcapng", std::process::id()));
+        std::fs::write(&path, capture).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_pincer"))
+            .args(args)
+            .arg(&path)
+            .output()
+            .expect("binary must run");
+        std::fs::remove_file(&path).ok();
+        out
+    }
+
+    /// A corrupt second SHB (`BadMagic` mid-stream) must degrade, not discard:
+    /// the first section's packets are reported, `damaged_section` is set —
+    /// distinct from `truncated_tail` — and stderr says why.
+    #[test]
+    fn corrupt_second_shb_keeps_first_sections_packets() {
+        let file = capture_with_damaged_tail(&shb_bad_bom());
+
+        let out = run_on("bad-second-shb", &file, &["flows", "--json"]);
+        assert!(
+            out.status.success(),
+            "damage after good data must not discard it: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let flows = json
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .expect("flows data is an array");
+        assert_eq!(flows.len(), 2, "the first section's packets are reported");
+        assert_eq!(
+            json.pointer("/degradation/damaged_section"),
+            Some(&serde_json::Value::Bool(true)),
+            "the envelope must flag the damaged section"
+        );
+        assert_eq!(
+            json.pointer("/degradation/truncated_tail"),
+            Some(&serde_json::Value::Bool(false)),
+            "section damage is not a truncated tail"
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("section header"),
+            "stderr must warn about the damaged section: {stderr}"
+        );
+    }
+
+    /// Same degradation shape for a second SHB whose major version is unknown
+    /// (`BadVersion` mid-stream).
+    #[test]
+    fn unknown_version_second_shb_degrades_too() {
+        let file = capture_with_damaged_tail(&shb_le_v2());
+
+        let out = run_on("v2-second-shb", &file, &["summary", "--json"]);
+        assert!(out.status.success(), "degraded is not broken: exit 0");
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            json.pointer("/data/packets")
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "packets before the bad section still count"
+        );
+        assert_eq!(
+            json.pointer("/degradation/damaged_section"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    /// A corrupt FIRST header is an unreadable file, not a damaged tail: hard
+    /// error, exit 1, nothing on stdout.
+    #[test]
+    fn corrupt_first_section_header_still_hard_errors() {
+        for (tag, file) in [
+            ("bad-first-bom", shb_bad_bom()),
+            ("bad-first-version", shb_le_v2()),
+        ] {
+            let out = run_on(tag, &file, &["summary", "--json"]);
+            assert_eq!(out.status.code(), Some(1), "{tag}: must fail hard");
+            assert!(
+                out.stdout.is_empty(),
+                "{tag}: errors must not pollute stdout"
+            );
+            assert!(!out.stderr.is_empty(), "{tag}: error must reach stderr");
+        }
+    }
 }

@@ -9,6 +9,7 @@
 //!
 //! Skips silently when the directory is absent (CI without downloads).
 #![allow(
+    clippy::print_stderr,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
@@ -40,6 +41,11 @@ fn real_captures() -> Vec<std::path::PathBuf> {
         })
         .collect();
     files.sort();
+    if files.is_empty() {
+        // Make the skip visible in test output: a missing corpus must not
+        // masquerade as a passing suite.
+        eprintln!("real_world: no captures in testdata-real/ — suite is a no-op");
+    }
     files
 }
 
@@ -125,8 +131,13 @@ fn real_captures_run_the_full_pipeline_cleanly() {
                         assets.observe(&pkt, app.as_ref());
                     }
                 }
-                Ok(None) => break,
-                // A cut-off final record is tolerable in real files.
+                // Clean EOF — or, same tolerance as the CLI, a damaged tail:
+                // partial analysis, not an erased one.
+                Ok(None)
+                | Err(
+                    pincer::error::PcapError::TruncatedFile { .. }
+                    | pincer::error::PcapError::BadLength { .. },
+                ) => break,
                 Err(e) => panic!("{}: container error mid-stream: {e}", path.display()),
             }
         }
