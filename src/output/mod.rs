@@ -54,6 +54,16 @@ pub struct DhcpRecord {
 }
 
 impl DnsRecord {
+    /// How many records [`Self::push_from`] would append for this event,
+    /// counted without building them — keeps the post-cap drop accounting
+    /// record-exact (a multi-answer event is not "one drop") at zero
+    /// allocation.
+    #[must_use]
+    pub fn count_from(event: &AppEvent) -> usize {
+        let AppEvent::Dns(dns) = event else { return 0 };
+        dns.queries.len().saturating_add(dns.answers.len())
+    }
+
     /// Flatten one DNS event, appending zero or more records to `out`.
     pub fn push_from(event: &AppEvent, out: &mut Vec<Self>) {
         let AppEvent::Dns(dns) = event else { return };
@@ -85,6 +95,12 @@ impl DnsRecord {
 }
 
 impl DhcpRecord {
+    /// The DHCP twin of [`DnsRecord::count_from`]: one record per event.
+    #[must_use]
+    pub fn count_from(event: &AppEvent) -> usize {
+        usize::from(matches!(event, AppEvent::Dhcp(_)))
+    }
+
     /// Flatten one DHCP event, appending its record to `out`.
     pub fn push_from(event: &AppEvent, out: &mut Vec<Self>) {
         let AppEvent::Dhcp(dhcp) = event else { return };

@@ -192,8 +192,7 @@ struct Pass {
 }
 
 impl Pass {
-    fn run(file: &std::path::Path, needs: Needs) -> Result<Self, Error> {
-        let limits = Limits::default();
+    fn run(file: &std::path::Path, needs: Needs, limits: Limits) -> Result<Self, Error> {
         let mut reader = pcap::open_input(file).map_err(|source| Error::Capture {
             path: file.to_path_buf(),
             source,
@@ -268,7 +267,10 @@ impl Pass {
             }
             if let Some(event) = app_ref {
                 // One event can append many records; trim back to the cap so
-                // it is exact, not "cap plus up to one event's worth".
+                // it is exact, not "cap plus up to one event's worth". Past
+                // the cap, count the records the event *would* have appended
+                // (`count_from`, allocation-free) — the dropped counter is in
+                // record units throughout, never "one per event".
                 if needs.dns {
                     if pass.dns.len() < limits.max_dns_records {
                         DnsRecord::push_from(event, &mut pass.dns);
@@ -278,7 +280,9 @@ impl Pass {
                             pass.dns_dropped = pass.dns_dropped.saturating_add(over as u64);
                         }
                     } else {
-                        pass.dns_dropped = pass.dns_dropped.saturating_add(1);
+                        pass.dns_dropped = pass
+                            .dns_dropped
+                            .saturating_add(DnsRecord::count_from(event) as u64);
                     }
                 }
                 if needs.dhcp {
@@ -290,7 +294,9 @@ impl Pass {
                             pass.dhcp_dropped = pass.dhcp_dropped.saturating_add(over as u64);
                         }
                     } else {
-                        pass.dhcp_dropped = pass.dhcp_dropped.saturating_add(1);
+                        pass.dhcp_dropped = pass
+                            .dhcp_dropped
+                            .saturating_add(DhcpRecord::count_from(event) as u64);
                     }
                 }
             }
@@ -363,7 +369,7 @@ impl Pass {
         }
         if self.dns_dropped > 0 || self.dhcp_dropped > 0 {
             warn(format!(
-                "detail-record caps reached (dropped {} dns, {} dhcp events)",
+                "detail-record caps reached (dropped {} dns, {} dhcp records)",
                 self.dns_dropped, self.dhcp_dropped
             ));
         }
@@ -402,7 +408,7 @@ impl Pass {
 }
 
 fn run_analysis(common: &Common, which: Which) -> Result<(), Error> {
-    let pass = Pass::run(&common.file, which.needs())?;
+    let pass = Pass::run(&common.file, which.needs(), Limits::default())?;
     let assets = pass.assets.assets();
     let report = match which {
         Which::Summary => Report::Summary(&pass.stats),
@@ -422,7 +428,7 @@ fn run_deps(args: &DepsArgs) -> Result<(), Error> {
         assets: true,
         ..Needs::default()
     };
-    let pass = Pass::run(&args.common.file, needs)?;
+    let pass = Pass::run(&args.common.file, needs, Limits::default())?;
     let edges = dependency_edges(&pass.flows, &pass.assets);
     if args.dot && !args.common.json {
         return write_stdout(&deps_dot(&edges));
@@ -514,4 +520,107 @@ fn write_stdout(text: &str) -> Result<(), Error> {
     let mut lock = stdout.lock();
     lock.write_all(text.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::net::Ipv4Addr;
+
+    use super::*;
+    use crate::fixtures::{self, Packet};
+    use crate::types::{MacAddr, Timestamp};
+
+    /// mDNS response carrying `count` A answers and no questions — one packet
+    /// appending many records, so the cap can be crossed mid-event.
+    fn mdns_multi_answer(count: u8) -> Vec<u8> {
+        let mut msg = vec![0, 0, 0x84, 0x00, 0, 0]; // id 0, QR+AA, qd 0
+        msg.extend_from_slice(&u16::from(count).to_be_bytes()); // an
+        msg.extend_from_slice(&[0, 0, 0, 0]); // ns, ar
+        for i in 0..count {
+            msg.extend_from_slice(&fixtures::dns_name(&format!("host-{i}.local")));
+            msg.extend_from_slice(&[0, 1, 0x80, 1]); // A, cache-flush + IN
+            msg.extend_from_slice(&120u32.to_be_bytes());
+            msg.extend_from_slice(&[0, 4]);
+            msg.extend_from_slice(&[192, 168, 1, i]);
+        }
+        msg
+    }
+
+    fn write_capture(tag: &str, frames: &[(Timestamp, Vec<u8>)]) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("pincer-cli-{tag}-{}.pcap", std::process::id()));
+        let file = std::fs::File::create(&path).expect("temp capture");
+        fixtures::scenarios::write_pcap(frames, file).expect("write capture");
+        path
+    }
+
+    /// A flood of multi-answer mDNS responses against `Limits::tiny`
+    /// (`max_dns_records = 8`): the event that crosses the cap is trimmed
+    /// back so kept == cap exactly, and the dropped counter is record-exact —
+    /// including the records of events arriving wholly past the cap.
+    #[test]
+    fn dns_record_cap_trims_mid_event_and_counts_every_drop() {
+        let host = MacAddr([0xD0, 0x81, 0x7A, 1, 2, 3]);
+        let frames: Vec<(Timestamp, Vec<u8>)> = (0..4)
+            .map(|_| {
+                let frame = Packet::ethernet(host, MacAddr([0x01, 0, 0x5E, 0, 0, 0xFB]))
+                    .ipv4(
+                        Ipv4Addr::new(192, 168, 1, 77),
+                        Ipv4Addr::new(224, 0, 0, 251),
+                    )
+                    .udp(5353, 5353)
+                    .payload(&mdns_multi_answer(3));
+                (Timestamp::ZERO, frame)
+            })
+            .collect();
+        let path = write_capture("dns-cap", &frames);
+        let needs = Needs {
+            dns: true,
+            ..Needs::default()
+        };
+        let pass = Pass::run(&path, needs, Limits::tiny()).expect("analysis runs");
+        std::fs::remove_file(&path).ok();
+
+        // 12 answer records against a cap of 8: packet 3 lands mid-event
+        // (6 → 9, trimmed back to 8, 1 dropped) and packet 4 is wholly past
+        // the cap (3 dropped) — kept == cap, dropped == total − cap.
+        assert_eq!(pass.dns.len(), 8, "kept records must equal the cap");
+        assert_eq!(pass.dns_dropped, 4, "every dropped record counted");
+        assert!(pass.dns.iter().all(|r| r.role == "answer"));
+        assert_eq!(pass.degradation().dns_records_dropped, 4);
+    }
+
+    /// The DHCP mirror (`max_dhcp_records = 8`): one record per message, so
+    /// the cap engages between events — kept == cap and every post-cap
+    /// message is counted.
+    #[test]
+    fn dhcp_record_cap_holds_and_counts_every_drop() {
+        let frames: Vec<(Timestamp, Vec<u8>)> = (0..12u8)
+            .map(|i| {
+                let mac = MacAddr([0x02, 0, 0, 0, 0, i]);
+                let opts = fixtures::DhcpOptions {
+                    hostname: Some("flood-host"),
+                    ..fixtures::DhcpOptions::default()
+                };
+                let frame = Packet::ethernet(mac, MacAddr::BROADCAST)
+                    .ipv4(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST)
+                    .udp(68, 67)
+                    .payload(&fixtures::dhcp(1, mac, 0x1000 + u32::from(i), &opts));
+                (Timestamp::ZERO, frame)
+            })
+            .collect();
+        let path = write_capture("dhcp-cap", &frames);
+        let needs = Needs {
+            dhcp: true,
+            ..Needs::default()
+        };
+        let pass = Pass::run(&path, needs, Limits::tiny()).expect("analysis runs");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(pass.dhcp.len(), 8, "kept records must equal the cap");
+        assert_eq!(pass.dhcp_dropped, 4, "every dropped record counted");
+        assert_eq!(pass.degradation().dhcp_records_dropped, 4);
+    }
 }
