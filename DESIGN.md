@@ -133,7 +133,14 @@ has **three tiers** ([error.rs](src/error.rs)):
 
 1. **`PcapError` — the container is broken.** Bad magic number, an impossible
    block length, the file ends mid-header. This is fatal *to the stream*: we
-   can't trust the file's framing, so we stop. Returned by the reader.
+   can't trust the file's framing past that point, so we stop reading.
+   Returned by the reader. Fatal to the stream is not fatal to the *run*: the
+   CLI turns mid-stream damage — a truncated tail, a framing mismatch, a
+   corrupt later section header in a concatenated pcapng — into a flagged
+   partial report (`truncated_tail` / `damaged_section` in the degradation
+   envelope, plus a stderr warning) and keeps everything already analyzed.
+   Only an unreadable *initial* header, where nothing trustworthy has been
+   parsed yet, aborts with an error.
 
 2. **`DecodeError` — one packet is bad.** Truncated (ran out of bytes — normal,
    from snaplen) or malformed (claims to be IPv4 but isn't). This is **not**

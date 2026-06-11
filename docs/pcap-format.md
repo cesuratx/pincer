@@ -79,4 +79,8 @@ A sequence of typed, length-prefixed blocks. Every block:
 - The reader reports a final record cut off mid-file as `TruncatedFile`; the
   analysis driver tolerates that case and reports what it has, so a partial
   capture still yields results.
+- A corrupt *second* SHB in a concatenated file (bad byte-order magic or an
+  unknown major version) likewise stops the stream without discarding it: the
+  driver keeps the sections already read and flags `damaged_section`. The
+  first SHB getting the same damage is a hard error — nothing was readable.
 - Constant memory: one reusable buffer, so multi-GB files stream fine.

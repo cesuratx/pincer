@@ -731,3 +731,180 @@ mod pcapng_framing {
         assert_eq!(reader.skipped_blocks(), 5000 - 4096, "overflow counted");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Mid-stream section damage: a concatenated pcapng whose SECOND section header
+// is corrupt (bad byte-order magic or unknown major version). Everything
+// before it parsed clean — the analysis must keep those packets, set the
+// `damaged_section` degradation flag, and warn on stderr. Only an unreadable
+// FIRST header (nothing trustworthy parsed yet) stays a hard error.
+// ---------------------------------------------------------------------------
+
+mod damaged_sections {
+    use std::net::Ipv4Addr;
+    use std::process::{Command, Output};
+
+    use pincer::types::MacAddr;
+
+    fn shb_le() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&(-1i64).to_le_bytes());
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b
+    }
+
+    fn idb_le() -> Vec<u8> {
+        let mut b = 1u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b
+    }
+
+    fn epb_le(data: &[u8]) -> Vec<u8> {
+        let cap = u32::try_from(data.len()).unwrap();
+        let padded = data.len().next_multiple_of(4);
+        let total = u32::try_from(32 + padded).unwrap();
+        let mut b = 6u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&total.to_le_bytes());
+        for field in [0u32, 0, 0, cap, cap] {
+            b.extend_from_slice(&field.to_le_bytes());
+        }
+        b.extend_from_slice(data);
+        b.resize(b.len() + (padded - data.len()), 0);
+        b.extend_from_slice(&total.to_le_bytes());
+        b
+    }
+
+    /// SHB framing whose byte-order magic is garbage in both endiannesses —
+    /// the 12 corrupt bytes the audit appends to a valid section.
+    fn shb_bad_bom() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        b
+    }
+
+    /// Well-formed SHB declaring major version 2 — a version this reader must
+    /// refuse to guess at.
+    fn shb_le_v2() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&(-1i64).to_le_bytes());
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b
+    }
+
+    fn udp_frame(src_port: u16) -> Vec<u8> {
+        pincer::fixtures::Packet::ethernet(MacAddr([2, 0, 0, 0, 0, 1]), MacAddr([2, 0, 0, 0, 0, 2]))
+            .ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2))
+            .udp(src_port, 53)
+            .payload(b"x")
+    }
+
+    /// One valid section carrying two packets, then a damaged second SHB.
+    fn capture_with_damaged_tail(bad_shb: &[u8]) -> Vec<u8> {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        file.extend_from_slice(&epb_le(&udp_frame(40000)));
+        file.extend_from_slice(&epb_le(&udp_frame(40001)));
+        file.extend_from_slice(bad_shb);
+        file
+    }
+
+    fn run_on(tag: &str, capture: &[u8], args: &[&str]) -> Output {
+        let path = std::env::temp_dir().join(format!("pincer-{tag}-{}.pcapng", std::process::id()));
+        std::fs::write(&path, capture).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_pincer"))
+            .args(args)
+            .arg(&path)
+            .output()
+            .expect("binary must run");
+        std::fs::remove_file(&path).ok();
+        out
+    }
+
+    /// A corrupt second SHB (`BadMagic` mid-stream) must degrade, not discard:
+    /// the first section's packets are reported, `damaged_section` is set —
+    /// distinct from `truncated_tail` — and stderr says why.
+    #[test]
+    fn corrupt_second_shb_keeps_first_sections_packets() {
+        let file = capture_with_damaged_tail(&shb_bad_bom());
+
+        let out = run_on("bad-second-shb", &file, &["flows", "--json"]);
+        assert!(
+            out.status.success(),
+            "damage after good data must not discard it: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let flows = json
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .expect("flows data is an array");
+        assert_eq!(flows.len(), 2, "the first section's packets are reported");
+        assert_eq!(
+            json.pointer("/degradation/damaged_section"),
+            Some(&serde_json::Value::Bool(true)),
+            "the envelope must flag the damaged section"
+        );
+        assert_eq!(
+            json.pointer("/degradation/truncated_tail"),
+            Some(&serde_json::Value::Bool(false)),
+            "section damage is not a truncated tail"
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("section header"),
+            "stderr must warn about the damaged section: {stderr}"
+        );
+    }
+
+    /// Same degradation shape for a second SHB whose major version is unknown
+    /// (`BadVersion` mid-stream).
+    #[test]
+    fn unknown_version_second_shb_degrades_too() {
+        let file = capture_with_damaged_tail(&shb_le_v2());
+
+        let out = run_on("v2-second-shb", &file, &["summary", "--json"]);
+        assert!(out.status.success(), "degraded is not broken: exit 0");
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            json.pointer("/data/packets")
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "packets before the bad section still count"
+        );
+        assert_eq!(
+            json.pointer("/degradation/damaged_section"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    /// A corrupt FIRST header is an unreadable file, not a damaged tail: hard
+    /// error, exit 1, nothing on stdout.
+    #[test]
+    fn corrupt_first_section_header_still_hard_errors() {
+        for (tag, file) in [
+            ("bad-first-bom", shb_bad_bom()),
+            ("bad-first-version", shb_le_v2()),
+        ] {
+            let out = run_on(tag, &file, &["summary", "--json"]);
+            assert_eq!(out.status.code(), Some(1), "{tag}: must fail hard");
+            assert!(
+                out.stdout.is_empty(),
+                "{tag}: errors must not pollute stdout"
+            );
+            assert!(!out.stderr.is_empty(), "{tag}: error must reach stderr");
+        }
+    }
+}

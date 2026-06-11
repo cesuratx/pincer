@@ -66,9 +66,11 @@ Memory stays constant either way.
 
 Analysis collections are hard-capped (`analysis::Limits`) so a hostile capture
 degrades instead of exhausting memory. Anything that degrades a run — a
-truncated tail, malformed blocks skipped, caps hit, records without timestamps
-(pcapng Simple Packet Blocks) — is reported as warnings on stderr and
-machine-readably in the `degradation` object of every `--json` envelope.
+truncated tail, a corrupt mid-stream section header (concatenated pcapng),
+malformed blocks skipped, caps hit, records without timestamps (pcapng Simple
+Packet Blocks) — is reported as warnings on stderr and machine-readably in the
+`degradation` object of every `--json` envelope. Only a capture whose initial
+header is unreadable fails outright.
 Timestamp-less records are excluded from every first/last time and duration —
 time fields stay `null`/absent rather than reading as the 1970 epoch — and a
 capture whose timestamps span more than five years sets a `clock_inconsistent`

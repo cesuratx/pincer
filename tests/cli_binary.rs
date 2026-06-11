@@ -30,7 +30,7 @@ fn every_analysis_subcommand_emits_the_versioned_json_envelope() {
         let json: serde_json::Value =
             serde_json::from_slice(&out.stdout).expect("stdout must be pure JSON");
         assert_eq!(json["tool"], "pincer", "{cmd}: envelope tool field");
-        assert_eq!(json["schema"], "3", "{cmd}: envelope schema version");
+        assert_eq!(json["schema"], "4", "{cmd}: envelope schema version");
         assert_eq!(json["command"], cmd, "{cmd}: envelope discriminator");
         assert!(json.get("data").is_some(), "{cmd}: envelope data field");
         let degradation = json
@@ -39,6 +39,10 @@ fn every_analysis_subcommand_emits_the_versioned_json_envelope() {
         assert_eq!(
             degradation["truncated_tail"], false,
             "{cmd}: office capture is intact"
+        );
+        assert_eq!(
+            degradation["damaged_section"], false,
+            "{cmd}: office capture has no damaged section"
         );
         assert_eq!(degradation["skipped_blocks"], 0, "{cmd}: nothing skipped");
         assert_data_shape(cmd, &json["data"]);

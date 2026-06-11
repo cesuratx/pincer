@@ -171,6 +171,9 @@ struct Pass {
     undecodable: u64,
     /// The capture ended on a record cut short mid-file.
     truncated_tail: bool,
+    /// A later section header (concatenated pcapng) was unreadable; the
+    /// analysis covers only the sections before it.
+    damaged_section: bool,
     /// Well-framed pcapng packet blocks with malformed bodies, skipped by
     /// the reader.
     skipped_blocks: u64,
@@ -208,6 +211,16 @@ impl Pass {
                 // says "partial".
                 Err(PcapError::TruncatedFile { .. } | PcapError::BadLength { .. }) => {
                     pass.truncated_tail = true;
+                    break;
+                }
+                // A later SHB with a corrupt byte-order magic or an unknown
+                // major version. `next_record` can only surface these from a
+                // *second or later* section header — the initial one was
+                // validated by `open_input` above — so this is the same
+                // mid-stream damage shape: everything before the bad section
+                // parsed clean and is kept.
+                Err(PcapError::BadMagic(_) | PcapError::BadVersion { .. }) => {
+                    pass.damaged_section = true;
                     break;
                 }
                 Err(source) => {
@@ -299,6 +312,9 @@ impl Pass {
         if self.truncated_tail {
             warn("capture ends in a truncated record; reporting packets read so far".into());
         }
+        if self.damaged_section {
+            warn("a mid-stream section header is corrupt; reporting packets read before it".into());
+        }
         if self.undecodable > 0 {
             warn(format!(
                 "{} record(s) had an undecodable link layer and were excluded",
@@ -354,6 +370,7 @@ impl Pass {
         let of = self.assets.overflow();
         Degradation {
             truncated_tail: self.truncated_tail,
+            damaged_section: self.damaged_section,
             undecodable_records: self.undecodable,
             skipped_blocks: self.skipped_blocks,
             flows_dropped: self.flows.dropped(),

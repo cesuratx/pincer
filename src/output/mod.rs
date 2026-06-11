@@ -104,8 +104,11 @@ impl DhcpRecord {
 /// asset `first_seen`/`last_seen` are `null` when every sighting came from
 /// timestamp-less records (pcapng SPB) — previously a fabricated 1970 epoch;
 /// summary gains `clock_inconsistent` and `anomalies.timestampless`, and the
-/// degradation envelope gains `timestampless_records`.
-pub const JSON_SCHEMA_VERSION: &str = "3";
+/// degradation envelope gains `timestampless_records`. v4: a corrupt
+/// mid-stream section header (concatenated pcapng) yields a flagged partial
+/// result — the degradation envelope gains `damaged_section` — where it
+/// previously discarded the whole run with an error.
+pub const JSON_SCHEMA_VERSION: &str = "4";
 
 /// Machine-readable record of everything that degraded this analysis —
 /// damaged input, skipped blocks, caps hit. Mirrors the stderr warnings so a
@@ -115,6 +118,9 @@ pub const JSON_SCHEMA_VERSION: &str = "3";
 pub struct Degradation {
     /// The capture ended on a record cut short mid-file.
     pub truncated_tail: bool,
+    /// A mid-stream section header (concatenated pcapng) was corrupt; the
+    /// analysis covers only the sections before it.
+    pub damaged_section: bool,
     /// Records whose link layer could not be decoded at all.
     pub undecodable_records: u64,
     /// Well-framed pcapng packet blocks with malformed bodies, skipped.
