@@ -21,7 +21,12 @@ Subcommands: `summary`, `flows`, `assets`, `services`, `deps` (`--dot` for
 Graphviz), `dns`, `dhcp`, `gen`. Every analysis subcommand accepts `--json`,
 and `-` as the file argument streams from stdin (`gzcat big.pcap.gz | pincer
 flows -`). Hostile-flood caps live in `analysis::Limits`; cap drops and other
-degradation are reported on stderr and in the JSON envelope.
+degradation are reported on stderr, in the JSON envelope (whose `degradation`
+field always precedes `data` in the byte stream), in the `# pincer: …
+complete|PARTIAL` table footer, and as a `// pincer: PARTIAL` header on
+degraded DOT. The global `--strict` flag turns any degradation into exit 3
+(default stays exit 0). JSON renders by streaming (`Report::write_json`);
+tables/DOT still materialize their string.
 
 ## Definition of done
 

@@ -30,7 +30,7 @@ fn every_analysis_subcommand_emits_the_versioned_json_envelope() {
         let json: serde_json::Value =
             serde_json::from_slice(&out.stdout).expect("stdout must be pure JSON");
         assert_eq!(json["tool"], "pincer", "{cmd}: envelope tool field");
-        assert_eq!(json["schema"], "4", "{cmd}: envelope schema version");
+        assert_eq!(json["schema"], "5", "{cmd}: envelope schema version");
         assert_eq!(json["command"], cmd, "{cmd}: envelope discriminator");
         assert!(json.get("data").is_some(), "{cmd}: envelope data field");
         let degradation = json
@@ -134,6 +134,125 @@ fn deps_dot_emits_identity_keyed_graphviz() {
     assert!(dot.trim_end().ends_with('}'));
     // Node declarations carry display names as labels; identity is the key.
     assert!(dot.contains("[label="), "nodes must declare labels");
+}
+
+/// The committed office capture with its last 7 bytes cut off — a record cut
+/// short mid-file, the canonical degraded-but-not-broken input
+/// (`truncated_tail` fires; exit stays 0 without `--strict`).
+fn truncated_office(tag: &str) -> std::path::PathBuf {
+    let bytes = std::fs::read(OFFICE).expect("committed sample");
+    let cut = bytes.len().checked_sub(7).unwrap();
+    let path = std::env::temp_dir().join(format!("pincer-trunc-{tag}-{}.pcap", std::process::id()));
+    std::fs::write(&path, &bytes[..cut]).unwrap();
+    path
+}
+
+/// `--strict` is the exit-code contract for degraded runs: 3 when anything
+/// degraded, 0 otherwise — and never anything but 0 without the flag, so
+/// existing pipelines keep working.
+#[test]
+fn strict_turns_degradation_into_exit_3() {
+    let trunc = truncated_office("strict");
+
+    let out = pincer(&["summary", trunc.to_str().unwrap(), "--strict"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "degraded + --strict must exit 3"
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("PARTIAL"),
+        "the full report is still emitted: {text}"
+    );
+
+    let out = pincer(&["summary", trunc.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "without --strict degraded is 0");
+
+    let out = pincer(&["summary", OFFICE, "--strict"]);
+    assert_eq!(out.status.code(), Some(0), "clean + --strict stays 0");
+
+    // The flag is global: it must also gate the DOT path.
+    let out = pincer(&["deps", trunc.to_str().unwrap(), "--dot", "--strict"]);
+    assert_eq!(out.status.code(), Some(3), "--strict applies to deps --dot");
+
+    std::fs::remove_file(&trunc).ok();
+}
+
+/// Every table ends with the `# pincer:` footer — the completion marker a
+/// pipe-truncated table cannot fake — carrying the row count, and the
+/// PARTIAL reasons when degraded.
+#[test]
+fn table_footer_is_the_in_band_completion_marker() {
+    let out = pincer(&["flows", OFFICE]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let last = text.lines().last().unwrap();
+    assert!(
+        last.starts_with("# pincer: ") && last.ends_with("row(s), complete"),
+        "clean run must end with the completion footer: {last}"
+    );
+
+    let trunc = truncated_office("footer");
+    let out = pincer(&["flows", trunc.to_str().unwrap()]);
+    std::fs::remove_file(&trunc).ok();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let last = text.lines().last().unwrap();
+    assert!(
+        last.contains("PARTIAL") && last.contains("truncated_tail"),
+        "degraded run must name its damage in the footer: {last}"
+    );
+}
+
+/// A degraded `deps --dot` leads with a `// pincer: PARTIAL` comment and is
+/// still valid Graphviz; a clean graph carries no marker.
+#[test]
+fn dot_partial_header_appears_exactly_when_degraded() {
+    let out = pincer(&["deps", OFFICE, "--dot"]);
+    assert!(out.status.success());
+    let dot = String::from_utf8(out.stdout).unwrap();
+    assert!(!dot.contains("PARTIAL"), "clean graph must be unmarked");
+
+    let trunc = truncated_office("dot");
+    let out = pincer(&["deps", trunc.to_str().unwrap(), "--dot"]);
+    std::fs::remove_file(&trunc).ok();
+    assert!(out.status.success());
+    let dot = String::from_utf8(out.stdout).unwrap();
+    let first = dot.lines().next().unwrap();
+    assert!(
+        first.starts_with("// pincer: PARTIAL — ") && first.contains("truncated_tail"),
+        "degraded graph must lead with the marker: {first}"
+    );
+    assert!(dot.contains("digraph dependencies {"));
+    assert!(dot.trim_end().ends_with('}'), "still valid Graphviz");
+}
+
+/// The envelope's byte order is the salvage contract: `degradation` must
+/// precede `data`, so a truncated JSON document can never be repaired into
+/// data without its degradation record. Asserted on raw text — a parsed
+/// Value cannot see key order.
+#[test]
+fn json_degradation_precedes_data_in_the_byte_stream() {
+    for cmd in [
+        "summary", "flows", "assets", "services", "deps", "dns", "dhcp",
+    ] {
+        let out = pincer(&[cmd, OFFICE, "--json"]);
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        // Envelope keys sit at 2-space indent; data rows are nested deeper.
+        let degradation_at = text
+            .find("\n  \"degradation\":")
+            .unwrap_or_else(|| panic!("{cmd}: degradation key missing"));
+        let data_at = text
+            .find("\n  \"data\":")
+            .unwrap_or_else(|| panic!("{cmd}: data key missing"));
+        assert!(
+            degradation_at < data_at,
+            "{cmd}: degradation must precede data in the bytes"
+        );
+        serde_json::from_str::<serde_json::Value>(&text).expect("stdout must stay valid JSON");
+    }
 }
 
 #[test]

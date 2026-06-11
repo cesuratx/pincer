@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -25,9 +26,20 @@ use crate::pcap;
                   segment of a connection."
 )]
 pub struct Cli {
+    /// Exit 3 instead of 0 when the analysis is degraded (truncated tail,
+    /// damaged section, undecodable records, any cap hit) — for pipelines
+    /// that must branch on partial results. The output is still emitted in
+    /// full either way.
+    #[arg(long, global = true)]
+    pub strict: bool,
     #[command(subcommand)]
     pub command: Command,
 }
+
+/// Exit code under `--strict` for a degraded analysis. Distinct from 1
+/// (error: nothing useful emitted) and 2 (usage): the report WAS emitted, in
+/// full, but covers a damaged or capped input.
+pub const EXIT_DEGRADED: u8 = 3;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -91,19 +103,28 @@ pub enum Scenario {
     All,
 }
 
-/// Parse args and dispatch. Returns a process exit code worth of error via
-/// [`Error`].
-pub fn run() -> Result<(), Error> {
+/// Parse args and dispatch. `Ok` carries the exit status (0, or
+/// [`EXIT_DEGRADED`] under `--strict`); errors map to 1 via [`Error`].
+pub fn run() -> Result<ExitCode, Error> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Gen(args) => run_gen(&args),
-        Command::Summary(common) => run_analysis(&common, Which::Summary),
-        Command::Flows(common) => run_analysis(&common, Which::Flows),
-        Command::Assets(common) => run_analysis(&common, Which::Assets),
-        Command::Services(common) => run_analysis(&common, Which::Services),
-        Command::Dns(common) => run_analysis(&common, Which::Dns),
-        Command::Dhcp(common) => run_analysis(&common, Which::Dhcp),
-        Command::Deps(args) => run_deps(&args),
+        Command::Gen(args) => run_gen(&args).map(|()| ExitCode::SUCCESS),
+        Command::Summary(common) => run_analysis(&common, Which::Summary, cli.strict),
+        Command::Flows(common) => run_analysis(&common, Which::Flows, cli.strict),
+        Command::Assets(common) => run_analysis(&common, Which::Assets, cli.strict),
+        Command::Services(common) => run_analysis(&common, Which::Services, cli.strict),
+        Command::Dns(common) => run_analysis(&common, Which::Dns, cli.strict),
+        Command::Dhcp(common) => run_analysis(&common, Which::Dhcp, cli.strict),
+        Command::Deps(args) => run_deps(&args, cli.strict),
+    }
+}
+
+/// Exit status for a finished, fully emitted analysis.
+fn exit_status(strict: bool, degradation: &Degradation) -> ExitCode {
+    if strict && degradation.any() {
+        ExitCode::from(EXIT_DEGRADED)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -407,7 +428,7 @@ impl Pass {
     }
 }
 
-fn run_analysis(common: &Common, which: Which) -> Result<(), Error> {
+fn run_analysis(common: &Common, which: Which, strict: bool) -> Result<ExitCode, Error> {
     let pass = Pass::run(&common.file, which.needs(), Limits::default())?;
     let assets = pass.assets.assets();
     let report = match which {
@@ -418,10 +439,12 @@ fn run_analysis(common: &Common, which: Which) -> Result<(), Error> {
         Which::Dns => Report::Dns(&pass.dns),
         Which::Dhcp => Report::Dhcp(&pass.dhcp),
     };
-    emit(&report, common.json, &pass.degradation())
+    let degradation = pass.degradation();
+    emit(&report, common.json, &degradation)?;
+    Ok(exit_status(strict, &degradation))
 }
 
-fn run_deps(args: &DepsArgs) -> Result<(), Error> {
+fn run_deps(args: &DepsArgs, strict: bool) -> Result<ExitCode, Error> {
     // Dependencies need both the flow table and the asset inventory.
     let needs = Needs {
         flows: true,
@@ -430,24 +453,35 @@ fn run_deps(args: &DepsArgs) -> Result<(), Error> {
     };
     let pass = Pass::run(&args.common.file, needs, Limits::default())?;
     let edges = dependency_edges(&pass.flows, &pass.assets);
+    let degradation = pass.degradation();
     if args.dot && !args.common.json {
-        return write_stdout(&deps_dot(&edges));
+        write_stdout(&deps_dot(&edges, &degradation))?;
+    } else {
+        emit(&Report::Deps(&edges), args.common.json, &degradation)?;
     }
-    emit(&Report::Deps(&edges), args.common.json, &pass.degradation())
+    Ok(exit_status(strict, &degradation))
 }
 
 fn emit(report: &Report<'_>, json: bool, degradation: &Degradation) -> Result<(), Error> {
-    let rendered = if json {
-        report.to_json(degradation)?
-    } else {
-        report.to_table()
-    };
     let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    lock.write_all(rendered.as_bytes())?;
+    // BufWriter: the JSON serializer streams field by field, and stdout's
+    // LineWriter would otherwise flush at every newline of pretty output.
+    let mut lock = std::io::BufWriter::new(stdout.lock());
     if json {
+        // serde_json wraps writer failures in its own error type; unwrap
+        // them back to `Error::Io` so a consumer closing the pipe early
+        // (`| head`) stays the quiet exit-0 path in `main`.
+        report
+            .write_json(degradation, &mut lock)
+            .map_err(|err| match err.io_error_kind() {
+                Some(kind) => Error::Io(std::io::Error::new(kind, err)),
+                None => Error::Json(err),
+            })?;
         lock.write_all(b"\n")?;
+    } else {
+        lock.write_all(report.to_table(degradation).as_bytes())?;
     }
+    lock.flush()?;
     Ok(())
 }
 

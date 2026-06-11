@@ -21,7 +21,8 @@ cargo run -- deps --dot testdata/office.pcap | dot -Tpng -o deps.png
 ```
 
 Subcommands: `summary`, `flows`, `assets`, `services`, `deps`, `dns`, `dhcp`,
-`gen`. All analysis commands take `--json`.
+`gen`. All analysis commands take `--json`, and `--strict` makes a degraded
+analysis exit 3 instead of 0.
 
 ## What it understands
 
@@ -71,6 +72,22 @@ malformed blocks skipped, caps hit, records without timestamps (pcapng Simple
 Packet Blocks) — is reported as warnings on stderr and machine-readably in the
 `degradation` object of every `--json` envelope. Only a capture whose initial
 header is unreadable fails outright.
+
+The degradation signal is also in-band in every output format, so a consumer
+that only sees stdout can still detect partial results:
+
+- **Tables** always end with a `# pincer: <n> row(s), complete` footer — or
+  `PARTIAL — <reasons>` when degraded. A piped table cut off mid-stream is
+  detectable by the missing footer; without that check, only `--json` output
+  is self-validating against truncation.
+- **`deps --dot`** prepends `// pincer: PARTIAL — <reasons>` to a degraded
+  graph.
+- **JSON** streams with `degradation` serialized *before* `data` (schema 5),
+  so even the salvaged prefix of a truncated document names its damage.
+
+Exit codes: 0 success (degraded runs included, so existing pipelines keep
+working), 1 error, 2 usage. Pass `--strict` to make any degradation exit 3
+instead — for pipelines that must branch on partial analysis.
 Timestamp-less records are excluded from every first/last time and duration —
 time fields stay `null`/absent rather than reading as the 1970 epoch — and a
 capture whose timestamps span more than five years sets a `clock_inconsistent`
