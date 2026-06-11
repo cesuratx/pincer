@@ -2,7 +2,7 @@
 //! the strategy seam — each subcommand produces one, and the caller picks the
 //! `--json` or table renderer.
 
-pub mod table;
+pub(crate) mod table;
 
 use std::fmt::Write as _;
 
@@ -14,6 +14,12 @@ use crate::app::{AppEvent, DnsRData};
 use table::{Align, Table, human_bytes};
 
 /// A finished analysis ready to render as a table, JSON, or DOT.
+///
+/// Rendering materializes the whole report in memory before writing. That is
+/// bounded — entry counts by [`crate::analysis::Limits`] and name lengths at
+/// the parsers — but a deliberately cap-saturating capture can make it large
+/// (hundreds of MB at the default caps). Lower the caps before raising them
+/// for untrusted input; streaming rendering is deliberately not attempted.
 #[derive(Debug)]
 pub enum Report<'a> {
     Summary(&'a Stats),
@@ -28,6 +34,9 @@ pub enum Report<'a> {
 /// A flat DNS observation for the `dns` subcommand.
 #[derive(Debug, Serialize)]
 pub struct DnsRecord {
+    /// `"query"` or `"answer"` — the clean discriminator; `kind` carries the
+    /// record type and is shared between both roles.
+    pub role: &'static str,
     pub kind: &'static str,
     pub name: String,
     pub value: String,
@@ -45,12 +54,13 @@ pub struct DhcpRecord {
 }
 
 impl DnsRecord {
-    /// Flatten one DNS event into zero or more records.
-    pub fn from_event(event: &AppEvent, out: &mut Vec<Self>) {
+    /// Flatten one DNS event, appending zero or more records to `out`.
+    pub fn push_from(event: &AppEvent, out: &mut Vec<Self>) {
         let AppEvent::Dns(dns) = event else { return };
         for query in &dns.queries {
             out.push(Self {
-                kind: "query",
+                role: "query",
+                kind: dns_type_name(query.qtype),
                 name: query.name.clone(),
                 value: dns_type_name(query.qtype).to_string(),
             });
@@ -65,6 +75,7 @@ impl DnsRecord {
                 DnsRData::Other { rtype } => ("?", format!("type-{rtype}")),
             };
             out.push(Self {
+                role: "answer",
                 kind,
                 name: answer.name.clone(),
                 value,
@@ -74,7 +85,8 @@ impl DnsRecord {
 }
 
 impl DhcpRecord {
-    pub fn from_event(event: &AppEvent, out: &mut Vec<Self>) {
+    /// Flatten one DHCP event, appending its record to `out`.
+    pub fn push_from(event: &AppEvent, out: &mut Vec<Self>) {
         let AppEvent::Dhcp(dhcp) = event else { return };
         out.push(Self {
             msg_type: dhcp.msg_type.to_string(),
@@ -89,7 +101,32 @@ impl DhcpRecord {
 
 /// Stable JSON envelope version. Bump on any breaking change to the `data`
 /// shapes so consumers can version-lock.
-pub const JSON_SCHEMA_VERSION: &str = "1";
+pub const JSON_SCHEMA_VERSION: &str = "2";
+
+/// Machine-readable record of everything that degraded this analysis —
+/// damaged input, skipped blocks, caps hit. Mirrors the stderr warnings so a
+/// JSON consumer can detect partial results without scraping stderr; always
+/// present in the envelope (all zeros means the analysis was complete).
+#[derive(Debug, Default, Serialize)]
+pub struct Degradation {
+    /// The capture ended on a record cut short mid-file.
+    pub truncated_tail: bool,
+    /// Records whose link layer could not be decoded at all.
+    pub undecodable_records: u64,
+    /// Well-framed pcapng packet blocks with malformed bodies, skipped.
+    pub skipped_blocks: u64,
+    pub flows_dropped: u64,
+    pub assets_dropped: u64,
+    pub bindings_dropped: u64,
+    pub subnets_dropped: u64,
+    pub hostnames_dropped: u64,
+    pub services_dropped: u64,
+    pub dns_records_dropped: u64,
+    pub dhcp_records_dropped: u64,
+    /// IPs whose MAC binding changed mid-capture — flow attribution for them
+    /// uses the final binding and is therefore ambiguous.
+    pub ips_rebound: u64,
+}
 
 impl Report<'_> {
     /// The subcommand name, used as the JSON envelope discriminator.
@@ -107,15 +144,18 @@ impl Report<'_> {
     }
 
     /// Render as a pretty JSON document wrapped in a stable, versioned
-    /// envelope: `{ tool, version, schema, command, data }`. The envelope
-    /// gives every subcommand one discriminated, machine-parseable shape and a
-    /// version a consumer can pin — what the mixed bare arrays/objects lacked.
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+    /// envelope: `{ tool, version, schema, command, degradation, data }`. The
+    /// envelope gives every subcommand one discriminated, machine-parseable
+    /// shape and a version a consumer can pin — what the mixed bare
+    /// arrays/objects lacked. `degradation` is always present so partial
+    /// analysis is machine-detectable, not stderr-only.
+    pub fn to_json(&self, degradation: &Degradation) -> Result<String, serde_json::Error> {
         let envelope = json!({
             "tool": "pincer",
             "version": env!("CARGO_PKG_VERSION"),
             "schema": JSON_SCHEMA_VERSION,
             "command": self.command_name(),
+            "degradation": degradation,
             "data": self.data_json()?,
         });
         serde_json::to_string_pretty(&envelope)
@@ -136,6 +176,7 @@ impl Report<'_> {
                     "truncated": stats.truncated_packets,
                     "malformed": stats.malformed_packets,
                     "undecodable": stats.undecodable,
+                    "skipped_blocks": stats.skipped_blocks,
                 },
             }),
             Self::Flows(flows) => {
@@ -147,7 +188,9 @@ impl Report<'_> {
                             "client": flow.client().to_string(),
                             "server": flow.server().to_string(),
                             "proto": flow.key.proto().to_string(),
-                            "app": flow.app_label(),
+                            // null, not the table's "-" sentinel: JSON has a
+                            // way to say "unknown" and consumers expect it.
+                            "app": (flow.app_label() != "-").then(|| flow.app_label()),
                             "server_name": flow.server_name(),
                             "packets": flow.total_packets(),
                             "bytes": flow.total_bytes(),
@@ -162,7 +205,16 @@ impl Report<'_> {
                     .collect();
                 serde_json::Value::Array(items)
             }
-            Self::Assets(assets) | Self::Services(assets) => serde_json::to_value(assets)?,
+            Self::Assets(assets) => serde_json::to_value(assets)?,
+            // Match the table semantics: `services` lists hosts that HAVE
+            // services, not the whole inventory under a different name.
+            Self::Services(assets) => {
+                let servers: Vec<_> = assets
+                    .iter()
+                    .filter(|asset| !asset.services().is_empty())
+                    .collect();
+                serde_json::to_value(servers)?
+            }
             Self::Deps(edges) => serde_json::to_value(edges)?,
             Self::Dns(records) => serde_json::to_value(records)?,
             Self::Dhcp(records) => serde_json::to_value(records)?,
@@ -187,12 +239,26 @@ impl Report<'_> {
 
 /// Render the dependency edges as a Graphviz DOT graph. Confirmed edges
 /// (SYN-ACK seen) are solid; inferred ones are dashed.
+///
+/// Nodes are identified by the asset's unique key (MAC/IP), with the display
+/// name carried in the `label` attribute. In DOT the quoted identifier IS the
+/// node identity — identifying by display name would merge two distinct
+/// assets that share (or forge) a hostname into one node.
 #[must_use]
 pub fn deps_dot(edges: &[DepEdge]) -> String {
     let mut dot = String::from("digraph dependencies {\n");
     dot.push_str("  rankdir=LR;\n");
     dot.push_str("  node [shape=box, style=rounded, fontname=\"monospace\"];\n");
     dot.push_str("  edge [fontname=\"monospace\", fontsize=10];\n");
+
+    let mut nodes = std::collections::BTreeMap::new();
+    for edge in edges {
+        nodes.insert(&edge.client, &edge.client_label);
+        nodes.insert(&edge.server, &edge.server_label);
+    }
+    for (key, label) in nodes {
+        let _ = writeln!(dot, "  {key:?} [label={label:?}];");
+    }
 
     for edge in edges {
         let service = edge.service.unwrap_or(edge.proto.as_str());
@@ -201,8 +267,8 @@ pub fn deps_dot(edges: &[DepEdge]) -> String {
         let _ = writeln!(
             dot,
             "  {:?} -> {:?} [label=\"{}/{} {}\", style={}];",
-            edge.client_label,
-            edge.server_label,
+            edge.client,
+            edge.server,
             service,
             edge.port,
             human_bytes(bytes),
@@ -218,7 +284,6 @@ pub fn deps_dot(edges: &[DepEdge]) -> String {
 const FIVE_YEARS_SECS: f64 = 5.0 * 365.25 * 86_400.0;
 
 fn render_summary(stats: &Stats) -> String {
-    use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "packets   {}", stats.packets);
     let _ = writeln!(out, "bytes     {}", human_bytes(stats.bytes));
@@ -255,12 +320,19 @@ fn render_summary(stats: &Stats) -> String {
     if !stats.app_protocols.is_empty() {
         let _ = writeln!(out, "{}", proto_line("app", &stats.app_protocols));
     }
-    let anomalies = stats.truncated_packets + stats.malformed_packets + stats.undecodable;
+    let anomalies = stats
+        .truncated_packets
+        .saturating_add(stats.malformed_packets)
+        .saturating_add(stats.undecodable)
+        .saturating_add(stats.skipped_blocks);
     if anomalies > 0 {
         let _ = writeln!(
             out,
-            "anomalies truncated={} malformed={} undecodable={}",
-            stats.truncated_packets, stats.malformed_packets, stats.undecodable
+            "anomalies truncated={} malformed={} undecodable={} skipped_blocks={}",
+            stats.truncated_packets,
+            stats.malformed_packets,
+            stats.undecodable,
+            stats.skipped_blocks
         );
     }
     out
@@ -336,7 +408,7 @@ fn render_services(assets: &[&Asset]) -> String {
                 svc.port.to_string(),
                 svc.proto.to_string(),
                 svc.name.unwrap_or("-").to_string(),
-                format!("{:?}", svc.evidence),
+                svc.evidence.to_string(),
             ]);
         }
     }
@@ -380,12 +452,14 @@ fn render_dns(records: &[DnsRecord]) -> String {
         return "no DNS traffic\n".to_string();
     }
     let mut table = Table::new(&[
+        ("role", Align::Left),
         ("kind", Align::Left),
         ("name", Align::Left),
         ("value", Align::Left),
     ]);
     for record in records {
         table.push(vec![
+            record.role.to_string(),
             record.kind.to_string(),
             record.name.clone(),
             record.value.clone(),
@@ -431,5 +505,57 @@ fn dns_type_name(qtype: u16) -> &'static str {
         33 => "SRV",
         255 => "ANY",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edge(client: &str, client_label: &str, server: &str, server_label: &str) -> DepEdge {
+        DepEdge {
+            client: client.to_string(),
+            client_label: client_label.to_string(),
+            server: server.to_string(),
+            server_label: server_label.to_string(),
+            port: 443,
+            proto: "tcp".to_string(),
+            service: Some("https"),
+            flows: 1,
+            bytes_c2s: 10,
+            bytes_s2c: 20,
+            confirmed: true,
+        }
+    }
+
+    /// Two distinct assets sharing a display name (mundane: two "iPhone"s;
+    /// hostile: malware naming itself after the DC) must stay distinct nodes.
+    #[test]
+    fn dot_nodes_keyed_by_identity_not_label() {
+        let edges = [
+            edge("aa:aa:aa:aa:aa:01", "iPhone", "10.0.0.1", "server"),
+            edge("aa:aa:aa:aa:aa:02", "iPhone", "10.0.0.1", "server"),
+        ];
+        let dot = deps_dot(&edges);
+        assert!(dot.contains("\"aa:aa:aa:aa:aa:01\" [label=\"iPhone\"];"));
+        assert!(dot.contains("\"aa:aa:aa:aa:aa:02\" [label=\"iPhone\"];"));
+        assert!(dot.contains("\"aa:aa:aa:aa:aa:01\" -> \"10.0.0.1\""));
+        assert!(dot.contains("\"aa:aa:aa:aa:aa:02\" -> \"10.0.0.1\""));
+        // exactly one declaration for the shared server node
+        assert_eq!(dot.matches("[label=\"server\"];").count(), 1);
+    }
+
+    /// A forged hostname carrying DOT syntax must arrive escaped, never as
+    /// structure.
+    #[test]
+    fn dot_labels_escape_quotes() {
+        let edges = [edge(
+            "aa:aa:aa:aa:aa:03",
+            "evil\"];x->y[\"",
+            "10.0.0.1",
+            "server",
+        )];
+        let dot = deps_dot(&edges);
+        assert!(dot.contains(r#"[label="evil\"];x->y[\""];"#));
     }
 }

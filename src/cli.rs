@@ -9,7 +9,7 @@ use crate::analysis::{AssetInventory, FlowTable, Limits, Observe, Stats, depende
 use crate::app::sniff;
 use crate::decode::decode_packet;
 use crate::error::{Error, PcapError};
-use crate::output::{DhcpRecord, DnsRecord, Report, deps_dot};
+use crate::output::{Degradation, DhcpRecord, DnsRecord, Report, deps_dot};
 use crate::pcap;
 
 #[derive(Debug, Parser)]
@@ -171,6 +171,9 @@ struct Pass {
     undecodable: u64,
     /// The capture ended on a record cut short mid-file.
     truncated_tail: bool,
+    /// Well-framed pcapng packet blocks with malformed bodies, skipped by
+    /// the reader.
+    skipped_blocks: u64,
     /// dns/dhcp detail rows dropped once their per-run cap was hit.
     dns_dropped: u64,
     dhcp_dropped: u64,
@@ -189,17 +192,18 @@ impl Pass {
             assets: AssetInventory::with_limits(limits),
             ..Self::default()
         };
-        // Asset inference and flow app-labels both rely on sniffed app events;
-        // skip the sniff work entirely when no sink consumes it.
-        let want_app = needs.assets || needs.flows || needs.dns || needs.dhcp || needs.stats;
 
         loop {
             let record = match reader.next_record() {
                 Ok(Some(record)) => record,
                 Ok(None) => break,
-                // A final record cut short mid-file: stop and report what we
-                // have — but flag it so the user knows the input was damaged.
-                Err(PcapError::TruncatedFile { .. }) => {
+                // Mid-stream damage — a record cut short (snaplen/truncated
+                // file) or framing whose lengths no longer add up: stop and
+                // report what we have, flagged, instead of discarding every
+                // packet already analyzed. A sensor that throws away an
+                // hour of evidence over a bad tail is worse than one that
+                // says "partial".
+                Err(PcapError::TruncatedFile { .. } | PcapError::BadLength { .. }) => {
                     pass.truncated_tail = true;
                     break;
                 }
@@ -218,7 +222,10 @@ impl Pass {
                 }
                 continue;
             };
-            let app = if want_app { sniff(&pkt) } else { None };
+            // Every subcommand consumes app events (stats/flows/assets label
+            // with them; dns/dhcp are built from them), so sniffing is
+            // unconditional — a "skip when unused" branch here was dead code.
+            let app = sniff(&pkt);
             let app_ref = app.as_ref();
 
             if needs.stats {
@@ -231,21 +238,38 @@ impl Pass {
                 pass.assets.observe(&pkt, app_ref);
             }
             if let Some(event) = app_ref {
+                // One event can append many records; trim back to the cap so
+                // it is exact, not "cap plus up to one event's worth".
                 if needs.dns {
                     if pass.dns.len() < limits.max_dns_records {
-                        DnsRecord::from_event(event, &mut pass.dns);
+                        DnsRecord::push_from(event, &mut pass.dns);
+                        let over = pass.dns.len().saturating_sub(limits.max_dns_records);
+                        if over > 0 {
+                            pass.dns.truncate(limits.max_dns_records);
+                            pass.dns_dropped = pass.dns_dropped.saturating_add(over as u64);
+                        }
                     } else {
                         pass.dns_dropped = pass.dns_dropped.saturating_add(1);
                     }
                 }
                 if needs.dhcp {
                     if pass.dhcp.len() < limits.max_dhcp_records {
-                        DhcpRecord::from_event(event, &mut pass.dhcp);
+                        DhcpRecord::push_from(event, &mut pass.dhcp);
+                        let over = pass.dhcp.len().saturating_sub(limits.max_dhcp_records);
+                        if over > 0 {
+                            pass.dhcp.truncate(limits.max_dhcp_records);
+                            pass.dhcp_dropped = pass.dhcp_dropped.saturating_add(over as u64);
+                        }
                     } else {
                         pass.dhcp_dropped = pass.dhcp_dropped.saturating_add(1);
                     }
                 }
             }
+        }
+
+        pass.skipped_blocks = reader.skipped_blocks();
+        if needs.stats {
+            pass.stats.note_skipped_blocks(pass.skipped_blocks);
         }
 
         // Resolve provisional bindings so asset keying is order-independent.
@@ -276,6 +300,12 @@ impl Pass {
                 self.undecodable
             ));
         }
+        if self.skipped_blocks > 0 {
+            warn(format!(
+                "{} malformed packet block(s) were skipped",
+                self.skipped_blocks
+            ));
+        }
         if self.flows.dropped() > 0 {
             warn(format!(
                 "flow table hit its cap; {} flow(s) dropped (results are partial)",
@@ -296,6 +326,34 @@ impl Pass {
                 self.dns_dropped, self.dhcp_dropped
             ));
         }
+        if of.rebound_ips > 0 {
+            warn(format!(
+                "{} IP(s) changed MAC binding during the capture (DHCP churn, \
+                 failover, or spoofing); flows for those IPs are attributed to \
+                 the final binding",
+                of.rebound_ips
+            ));
+        }
+    }
+
+    /// The same facts as [`Pass::warn_degradation`], but for the JSON
+    /// envelope — machine consumers must not have to scrape stderr.
+    fn degradation(&self) -> Degradation {
+        let of = self.assets.overflow();
+        Degradation {
+            truncated_tail: self.truncated_tail,
+            undecodable_records: self.undecodable,
+            skipped_blocks: self.skipped_blocks,
+            flows_dropped: self.flows.dropped(),
+            assets_dropped: of.assets,
+            bindings_dropped: of.bindings,
+            subnets_dropped: of.subnets,
+            hostnames_dropped: of.hostnames,
+            services_dropped: of.services,
+            dns_records_dropped: self.dns_dropped,
+            dhcp_records_dropped: self.dhcp_dropped,
+            ips_rebound: of.rebound_ips,
+        }
     }
 }
 
@@ -310,7 +368,7 @@ fn run_analysis(common: &Common, which: Which) -> Result<(), Error> {
         Which::Dns => Report::Dns(&pass.dns),
         Which::Dhcp => Report::Dhcp(&pass.dhcp),
     };
-    emit(&report, common.json)
+    emit(&report, common.json, &pass.degradation())
 }
 
 fn run_deps(args: &DepsArgs) -> Result<(), Error> {
@@ -325,12 +383,12 @@ fn run_deps(args: &DepsArgs) -> Result<(), Error> {
     if args.dot && !args.common.json {
         return write_stdout(&deps_dot(&edges));
     }
-    emit(&Report::Deps(&edges), args.common.json)
+    emit(&Report::Deps(&edges), args.common.json, &pass.degradation())
 }
 
-fn emit(report: &Report<'_>, json: bool) -> Result<(), Error> {
+fn emit(report: &Report<'_>, json: bool, degradation: &Degradation) -> Result<(), Error> {
     let rendered = if json {
-        report.to_json()?
+        report.to_json(degradation)?
     } else {
         report.to_table()
     };
