@@ -200,7 +200,7 @@ impl Asset {
             .map_or_else(|| self.key.to_string(), |(name, _)| name.clone())
     }
 
-    /// Returns `true` if the name was *dropped* at the per-asset cap (so the
+    /// Returns `true` if a name was *dropped* at the per-asset cap (so the
     /// inventory can count it) — degradation is never silent. Borrowed `name`:
     /// the steady state (the same mDNS name re-announced every packet) is a
     /// pure map probe; the String is allocated only on the insert path.
@@ -214,8 +214,22 @@ impl Asset {
             }
             return false;
         }
-        // mDNS/DNS name-flood backstop: bound distinct names per asset.
+        // mDNS/DNS name-flood backstop: bound distinct names per asset. At
+        // the cap, keep the lexicographically-smallest `cap` names — a new
+        // name is admitted only by evicting a larger one — so WHICH names
+        // survive a flood is a function of the name set, not arrival order.
+        // (Key order, not evidence grade: any deterministic choice beats
+        // first-come under a flood.) Either way the cap dropped a name.
         if self.hostnames.len() >= cap {
+            if self
+                .hostnames
+                .last_key_value()
+                .is_none_or(|(largest, _)| name >= largest.as_str())
+            {
+                return true;
+            }
+            self.hostnames.pop_last();
+            self.hostnames.insert(name.to_owned(), source);
             return true;
         }
         self.hostnames.insert(name.to_owned(), source);
@@ -233,7 +247,9 @@ impl Asset {
         // Keyed by (port, proto) so a full 65 K-port scan is O(log n) per
         // packet, not the O(n) linear Vec scan it used to be (which a scan
         // turned quadratic). The cap bounds memory; once reached we still
-        // upgrade evidence on known services but add no new ones.
+        // upgrade evidence on known services, and a new service is admitted
+        // only by evicting the largest (port, proto) key — the kept set is
+        // the smallest `cap` keys offered, independent of arrival order.
         if let Some(existing) = self.services.get_mut(&(port, proto)) {
             if evidence < *existing {
                 *existing = evidence;
@@ -241,22 +257,36 @@ impl Asset {
             return false;
         }
         if self.services.len() >= cap {
+            if self
+                .services
+                .last_key_value()
+                .is_none_or(|(largest, _)| (port, proto) >= *largest)
+            {
+                return true;
+            }
+            self.services.pop_last();
+            self.services.insert((port, proto), evidence);
             return true;
         }
         self.services.insert((port, proto), evidence);
         false
     }
 
-    /// Returns `true` if a *new* IP was dropped at the per-asset cap. One MAC
-    /// spraying fresh IPv6 link-local sources — local by definition, no
-    /// subnet learning needed — would otherwise grow this one set with the
-    /// streamed file; `max_bindings` does not bound it because
-    /// `record_local_host` runs even when `bind()` dropped at its cap.
+    /// Returns `true` if the per-asset cap dropped an IP. One MAC spraying
+    /// fresh addresses — ARP claims run `record_local_host` per packet even
+    /// when `bind()` dropped at its cap — would otherwise grow this one set
+    /// with the streamed file. At the cap, the smallest `cap` IPs are kept
+    /// (a new IP evicts a larger one), order-independently.
     fn add_ip(&mut self, ip: IpAddr, cap: usize) -> bool {
         if self.ips.contains(&ip) {
             return false;
         }
         if self.ips.len() >= cap {
+            if self.ips.last().is_none_or(|largest| ip >= *largest) {
+                return true;
+            }
+            self.ips.pop_last();
+            self.ips.insert(ip);
             return true;
         }
         self.ips.insert(ip);
@@ -265,7 +295,10 @@ impl Asset {
 }
 
 /// Tallies of what hostile floods forced us to drop — surfaced in reports so
-/// degradation is visible, never silent.
+/// degradation is visible, never silent. Each counter tallies capped *events*
+/// (admissions refused plus evictions made for a smaller key), so a nonzero
+/// value always means its cap engaged; the exact value can vary with packet
+/// order even though the surviving sets do not.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct AssetOverflow {
     pub assets: u64,
@@ -300,29 +333,42 @@ impl AssetOverflow {
 ///
 /// Known limitations (single-pass, passive): on an ARP-only network with a
 /// prefix wider than /24, same-segment hosts in a different /24 may be
-/// IP-keyed; classification can shift if a subnet is first learned partway
-/// through the capture; IPv6 locality covers link-local/ULA only (global SLAAC
-/// addresses on the segment are not recognized without NDP parsing).
+/// IP-keyed; resolver-style DNS naming is accepted only once the shared
+/// segment has been learned, so it can depend on where in the capture that
+/// happens; IPv6 locality covers link-local/ULA only (global SLAAC addresses
+/// on the segment are not recognized without NDP parsing).
 ///
 /// Every collection here is capped (see [`Limits`]); a hostile capture hits
 /// the cap and increments an [`AssetOverflow`] counter rather than exhausting
-/// memory.
+/// memory. Caps admit by *key order*, not arrival order: at a cap, a new key
+/// replaces the largest admitted one only if it sorts before it, so the
+/// surviving assets/bindings/subnets are the smallest N keys the capture
+/// offered, identical across packet reorderings. Residual order dependence
+/// under an engaged cap is confined to evidence already routed *through* a
+/// binding or asset that a smaller key later evicted (merged evidence cannot
+/// be unmerged, so such a host may split into MAC- and IP-keyed records) —
+/// and it always comes with nonzero overflow counters, so capped output is
+/// never mistaken for canonical.
 #[derive(Debug)]
 pub struct AssetInventory {
     /// asset key -> asset.
     assets: BTreeMap<AssetKey, Asset>,
-    /// IP -> owning MAC (authoritative: ARP, DHCP, and same-segment frames).
+    /// IP -> owning MAC (authoritative ARP/DHCP claims, plus data-frame
+    /// candidates confirmed by [`AssetInventory::finalize`]).
     ip_to_mac: BTreeMap<IpAddr, MacAddr>,
     /// Local IPv4 segments grouped by mask: `mask -> {network}`. Grouping by
     /// mask makes `is_local` `O(distinct_masks · log n)` — distinct masks are
     /// a tiny handful — instead of `O(total_subnets)` per packet.
     local_v4_subnets: BTreeMap<u32, BTreeSet<u32>>,
     subnet_count: usize,
-    /// Candidate IP→MAC pairs seen on data frames, to be confirmed against the
-    /// *final* subnet knowledge in [`AssetInventory::finalize`]. This is what
-    /// makes keying order-independent: a host whose frames arrive before the
-    /// ARP/DHCP that establishes its subnet is still MAC-keyed at the end.
-    provisional: BTreeMap<IpAddr, (MacAddr, Option<Timestamp>)>,
+    /// Candidate `IP → (MAC, first ts, last ts)` sightings from data frames,
+    /// to be confirmed against the *final* subnet knowledge in
+    /// [`AssetInventory::finalize`]. Data frames make no mid-stream binding
+    /// or inventory claim at all — deciding per-packet made membership and
+    /// keying depend on whether a host's frames preceded the ARP/DHCP that
+    /// taught its segment. The sighting window (first/last) carries the
+    /// host's honest seen times to the deferred record.
+    provisional: BTreeMap<IpAddr, (MacAddr, Option<Timestamp>, Option<Timestamp>)>,
     finalized: bool,
     limits: Limits,
     overflow: AssetOverflow,
@@ -371,11 +417,13 @@ impl AssetInventory {
         }
     }
 
-    /// Resolve provisional data-frame bindings against the *complete* subnet
-    /// knowledge, making the inventory order-independent. Idempotent. Call once
-    /// after the streaming pass and before reading [`AssetInventory::assets`]
-    /// — a host whose frames were seen before its subnet was learned is
-    /// MAC-keyed here, at the end.
+    /// Resolve provisional data-frame sightings against the *complete* subnet
+    /// knowledge, making the inventory order-independent — this is the only
+    /// place data frames bind or enter the inventory. Idempotent. Call once
+    /// after the streaming pass and before reading [`AssetInventory::assets`].
+    /// Deterministic for a given packet set: the provisional/subnet/binding
+    /// survivor sets are order-independent (smallest-N eviction) and the loop
+    /// walks `provisional` in key order.
     pub fn finalize(&mut self) {
         if self.finalized {
             return;
@@ -383,18 +431,20 @@ impl AssetInventory {
         self.finalized = true;
         // Snapshot to satisfy the borrow checker; provisional is bounded by
         // max_bindings, so this is a small, one-time pass.
-        let pending: Vec<(IpAddr, MacAddr, Option<Timestamp>)> = self
+        let pending: Vec<(IpAddr, MacAddr, Option<Timestamp>, Option<Timestamp>)> = self
             .provisional
             .iter()
-            .filter(|(ip, _)| !self.ip_to_mac.contains_key(ip) && self.is_local(**ip))
-            .map(|(ip, (mac, ts))| (*ip, *mac, *ts))
+            .filter(|(ip, _)| self.is_local(**ip))
+            .map(|(ip, (mac, first, last))| (*ip, *mac, *first, *last))
             .collect();
-        for (ip, mac, ts) in pending {
+        for (ip, mac, first, last) in pending {
+            // An already-authoritative binding is a free refresh; a conflict
+            // is the counted rebind ambiguity, same as a late ARP would be.
             self.bind(mac, ip);
-            // A data-frames-only host has no IP-keyed asset for bind() to
-            // promote; record it here, with the first-seen time the
-            // provisional actually observed, so the inventory lists it.
-            self.record_local_host(mac, Some(ip), ts);
+            // Record the host with the window its data frames actually
+            // spanned — two folds: min via `first`, max via `last`.
+            self.record_local_host(mac, Some(ip), first);
+            self.record_local_host(mac, None, last);
         }
     }
 
@@ -416,9 +466,9 @@ impl AssetInventory {
 
     /// Assets sorted by first-seen, then key — stable, readable order.
     ///
-    /// Call [`AssetInventory::finalize`] first (the CLI always does): a
-    /// caller that skips it gets order-dependent keying for hosts whose
-    /// segment was learned after their first frames.
+    /// Call [`AssetInventory::finalize`] first (the CLI always does): data
+    /// frames enter the inventory only there, so a caller that skips it sees
+    /// no hosts that were observed solely as data-frame endpoints.
     #[must_use]
     pub fn assets(&self) -> Vec<&Asset> {
         let mut out: Vec<&Asset> = self.assets.values().collect();
@@ -465,10 +515,27 @@ impl AssetInventory {
         }
         // Flood backstop checked BEFORE inserting: an attacker spraying fresh
         // masks/subnets must hit the cap and be counted, never grow the map
-        // unbounded (the empty-BTreeSet-per-mask leak the audit caught).
+        // unbounded (the empty-BTreeSet-per-mask leak the audit caught — a
+        // drained mask bucket is removed for the same reason). At the cap a
+        // new (mask, network) pair is admitted only by evicting the largest
+        // admitted pair, so the learned segments are the smallest
+        // `max_subnets` pairs the capture offered, in any packet order.
         if self.subnet_count >= self.limits.max_subnets {
             self.overflow.subnets = self.overflow.subnets.saturating_add(1);
-            return;
+            let largest = self
+                .local_v4_subnets
+                .last_key_value()
+                .and_then(|(m, nets)| nets.last().map(|n| (*m, *n)));
+            let Some((lmask, lnet)) = largest.filter(|l| (mask, network) < *l) else {
+                return;
+            };
+            if let Some(nets) = self.local_v4_subnets.get_mut(&lmask) {
+                nets.remove(&lnet);
+                if nets.is_empty() {
+                    self.local_v4_subnets.remove(&lmask);
+                }
+            }
+            self.subnet_count = self.subnet_count.saturating_sub(1);
         }
         self.local_v4_subnets
             .entry(mask)
@@ -487,11 +554,26 @@ impl AssetInventory {
         if !is_unicast(ip) {
             return;
         }
-        // One map descent via Entry (the FlowTable pattern). Rebinding a known
-        // IP (ARP refresh, or a spoofer reclaiming it) is free; only a
-        // brand-new IP counts against the cap. An ARP-spoof storm claiming
-        // millions of fresh IPs therefore stops growing the map.
+        // Rebinding a known IP (ARP refresh, or a spoofer reclaiming it) is
+        // free; only a brand-new IP touches the cap. At the cap a new IP is
+        // admitted only by evicting the largest bound IP, so the surviving
+        // bindings are the smallest `max_bindings` IPs offered, in any packet
+        // order. (An evicted IP's already-merged evidence stays on its MAC
+        // asset while later evidence keys by IP — the residual split the
+        // type-level docs call out.) An ARP-spoof storm claiming millions of
+        // fresh IPs still costs a bounded map plus a counter.
         let len = self.ip_to_mac.len();
+        if len >= self.limits.max_bindings && !self.ip_to_mac.contains_key(&ip) {
+            self.overflow.bindings = self.overflow.bindings.saturating_add(1);
+            if self
+                .ip_to_mac
+                .last_key_value()
+                .is_none_or(|(largest, _)| ip >= *largest)
+            {
+                return;
+            }
+            self.ip_to_mac.pop_last();
+        }
         match self.ip_to_mac.entry(ip) {
             Entry::Occupied(mut entry) => {
                 if *entry.get() == mac {
@@ -506,10 +588,6 @@ impl AssetInventory {
                 entry.insert(mac);
             }
             Entry::Vacant(entry) => {
-                if len >= self.limits.max_bindings {
-                    self.overflow.bindings = self.overflow.bindings.saturating_add(1);
-                    return;
-                }
                 entry.insert(mac);
             }
         }
@@ -520,9 +598,12 @@ impl AssetInventory {
         self.promote_ip_asset(ip, mac);
     }
 
-    /// Note a candidate IP→MAC pair seen on a data frame. Unlike [`bind`],
-    /// this makes no locality claim yet — [`finalize`] decides, once all
-    /// subnets are known. Bounded by `max_bindings`.
+    /// Note a candidate IP→MAC sighting on a data frame. Unlike [`bind`],
+    /// this makes no locality claim — [`AssetInventory::finalize`] decides,
+    /// once all subnets are known. Bounded by `max_bindings` with the same
+    /// smallest-N eviction (and the same comparator) as [`bind`], so the
+    /// candidates finalize sees — and therefore the bindings it confirms —
+    /// are order-independent; drops are counted under bindings, not silent.
     fn record_provisional(&mut self, mac: MacAddr, ip: IpAddr, ts: Option<Timestamp>) {
         if mac == MacAddr::BROADCAST || mac.is_multicast() || mac == MacAddr::ZERO {
             return;
@@ -530,21 +611,26 @@ impl AssetInventory {
         if !is_unicast(ip) {
             return;
         }
-        // One descent via Entry; the flood backstop (same as bind()) lives in
-        // the Vacant arm, counted under bindings so the drop is reported, not
-        // silent.
         let len = self.provisional.len();
+        if len >= self.limits.max_bindings && !self.provisional.contains_key(&ip) {
+            self.overflow.bindings = self.overflow.bindings.saturating_add(1);
+            if self
+                .provisional
+                .last_key_value()
+                .is_none_or(|(largest, _)| ip >= *largest)
+            {
+                return;
+            }
+            self.provisional.pop_last();
+        }
         match self.provisional.entry(ip) {
             Entry::Occupied(mut entry) => {
-                let (_, seen) = entry.get_mut();
-                *seen = Timestamp::min_opt(*seen, ts);
+                let (_, first, last) = entry.get_mut();
+                *first = Timestamp::min_opt(*first, ts);
+                *last = (*last).max(ts);
             }
             Entry::Vacant(entry) => {
-                if len >= self.limits.max_bindings {
-                    self.overflow.bindings = self.overflow.bindings.saturating_add(1);
-                    return;
-                }
-                entry.insert((mac, ts));
+                entry.insert((mac, ts, ts));
             }
         }
     }
@@ -620,23 +706,36 @@ impl AssetInventory {
         }
     }
 
-    /// Get or create an asset. Returns `None` when the inventory is at
-    /// `max_assets` and this is a new identity — a random-source-IP flood then
-    /// stops creating assets (counted) instead of exhausting memory. One map
-    /// descent via Entry (the `FlowTable` pattern), with the cap enforced in
-    /// the Vacant arm.
+    /// Get or create an asset, folding `ts` into the seen window either way —
+    /// first/last-seen are the min/max over every evidence event, never
+    /// first-event-wins, so they cannot depend on arrival order. Returns
+    /// `None` when the inventory is at `max_assets` and this new identity
+    /// sorts after every admitted one; at the cap a new identity is otherwise
+    /// admitted by evicting the largest admitted key (with its evidence), so
+    /// a random-source-IP flood costs bounded memory and WHICH assets survive
+    /// is a function of the identity set, not arrival order. `Mac` sorts
+    /// before `Ip`, so MAC-identified hosts are preferentially retained.
+    /// Refusals and evictions both count under `overflow.assets`.
     fn asset_mut(&mut self, key: AssetKey, ts: Option<Timestamp>) -> Option<&mut Asset> {
         let len = self.assets.len();
-        match self.assets.entry(key) {
-            Entry::Occupied(entry) => Some(entry.into_mut()),
-            Entry::Vacant(entry) => {
-                if len >= self.limits.max_assets {
-                    self.overflow.assets = self.overflow.assets.saturating_add(1);
-                    return None;
-                }
-                Some(entry.insert(Asset::new(key, ts)))
+        if len >= self.limits.max_assets && !self.assets.contains_key(&key) {
+            self.overflow.assets = self.overflow.assets.saturating_add(1);
+            if self
+                .assets
+                .last_key_value()
+                .is_none_or(|(largest, _)| key >= *largest)
+            {
+                return None;
             }
+            self.assets.pop_last();
         }
+        let asset = match self.assets.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(Asset::new(key, ts)),
+        };
+        asset.first_seen = Timestamp::min_opt(asset.first_seen, ts);
+        asset.last_seen = asset.last_seen.max(ts);
+        Some(asset)
     }
 
     fn record_local_host(&mut self, mac: MacAddr, ip: Option<IpAddr>, ts: Option<Timestamp>) {
@@ -644,12 +743,11 @@ impl AssetInventory {
             return;
         }
         let cap = self.limits.max_ips_per_asset;
+        // `asset_mut` folds `ts` into the first/last-seen window.
         let Some(asset) = self.asset_mut(AssetKey::Mac(mac), ts) else {
             return;
         };
         asset.macs.insert(mac);
-        asset.last_seen = asset.last_seen.max(ts);
-        asset.first_seen = Timestamp::min_opt(asset.first_seen, ts);
         let dropped = ip
             .filter(|ip| !ip.is_unspecified() && !ip.is_multicast())
             .is_some_and(|ip| asset.add_ip(ip, cap));
@@ -870,28 +968,20 @@ impl Observe for AssetInventory {
     fn observe(&mut self, pkt: &PacketView<'_>, app: Option<&AppEvent>) {
         let ts = pkt.ts;
 
-        // Layer 2/3 identity: bind the source MAC to its source IP, and record
-        // both endpoints as local hosts.
+        // Layer 2/3 identity. ARP speaks authoritatively about its own
+        // segment, so it binds and records immediately.
         if let NetView::Arp(arp) = &pkt.net {
             self.observe_arp(arp, ts);
         }
         if let Some((src_ip, dst_ip)) = pkt.ip_pair() {
-            // Only bind a MAC to an IP we believe shares its L2 segment.
-            // Off-link IPs share the *router's* MAC, so binding them would
-            // merge unrelated hosts; they stay IP-keyed instead.
-            if self.is_local(src_ip) {
-                self.bind(pkt.eth.src, src_ip);
-                self.record_local_host(pkt.eth.src, Some(src_ip), ts);
-            }
-            if self.is_local(dst_ip) {
-                self.bind(pkt.eth.dst, dst_ip);
-                self.record_local_host(pkt.eth.dst, Some(dst_ip), ts);
-            }
-            // Record both as candidates regardless of *current* locality:
-            // finalize() re-checks them against the final subnet set, so a
-            // host seen before its subnet was learned is still MAC-keyed. The
-            // router-MAC trap is avoided because finalize() also gates on
-            // locality — an off-link IP's candidate is simply never applied.
+            // Data frames only nominate candidates: whether an IP shares its
+            // frame's L2 segment can be judged only against the COMPLETE
+            // subnet knowledge, so finalize() binds and records the local
+            // ones at the end. Deciding per-packet made membership and keying
+            // depend on whether a host's frames preceded the ARP/DHCP that
+            // taught its segment. The router-MAC trap is avoided because
+            // finalize() gates on locality — an off-link IP's candidate is
+            // simply never applied.
             self.record_provisional(pkt.eth.src, src_ip, ts);
             self.record_provisional(pkt.eth.dst, dst_ip, ts);
         }
