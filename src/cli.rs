@@ -46,6 +46,12 @@ pub enum Command {
     /// DHCP messages, hostnames, and device fingerprints.
     Dhcp(Common),
     /// Generate the built-in sample captures into a directory.
+    ///
+    /// Each capture is written to a `<name>.pcap.tmp` file in the destination
+    /// directory, fsynced, then atomically renamed into place — the final
+    /// filename only ever holds a complete capture. An existing regular file
+    /// at the destination is replaced; anything else there (symlink,
+    /// directory, device) is refused.
     Gen(GenArgs),
 }
 
@@ -441,9 +447,43 @@ fn run_gen(args: &GenArgs) -> Result<(), Error> {
     let mut write_one =
         |name: &str, frames: &[(crate::types::Timestamp, Vec<u8>)]| -> Result<(), Error> {
             let path = args.out_dir.join(name);
-            let file = std::fs::File::create(&path).map_err(|e| Error::output(&path, e))?;
-            scenarios::write_pcap(frames, std::io::BufWriter::new(file))
-                .map_err(|e| Error::output(&path, e))?;
+            // The destination names are predictable, so a planted symlink (or
+            // directory/device) must be refused, never written through. Only
+            // a regular file may be replaced; `symlink_metadata` does not
+            // follow links, and the rename below replaces the name itself
+            // rather than its target.
+            if let Ok(meta) = std::fs::symlink_metadata(&path)
+                && !meta.is_file()
+            {
+                return Err(Error::output(
+                    &path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "destination exists and is not a regular file; refusing to overwrite",
+                    ),
+                ));
+            }
+            // Temp-then-rename within the same directory (atomic on POSIX;
+            // on Windows the `rename` result is the arbiter): the final name
+            // only ever holds a complete, fsynced capture, and a failed or
+            // interrupted run cannot destroy the previous good file.
+            // `create_new` (O_EXCL) refuses to follow a symlink planted at
+            // the temp name.
+            let tmp = args.out_dir.join(format!("{name}.tmp"));
+            let _ = std::fs::remove_file(&tmp); // stale debris from a crashed run
+            let result = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .and_then(|file| {
+                    scenarios::write_pcap(frames, std::io::BufWriter::new(&file))?;
+                    file.sync_all()?;
+                    std::fs::rename(&tmp, &path)
+                });
+            if let Err(e) = result {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::output(&path, e));
+            }
             wrote.push(path.display().to_string());
             Ok(())
         };

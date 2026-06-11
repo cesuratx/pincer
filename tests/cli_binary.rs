@@ -166,3 +166,71 @@ fn unknown_arguments_exit_2() {
         Some(2)
     );
 }
+
+/// Fresh per-test output directory under the system temp dir.
+fn gen_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pincer-gen-{tag}-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn gen_refuses_to_write_through_a_symlink_destination() {
+    #[cfg(unix)]
+    {
+        let dir = gen_dir("symlink");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"PRECIOUS DATA").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("office.pcap")).unwrap();
+
+        let out = pincer(&["gen", dir.to_str().unwrap(), "--scenario", "office"]);
+
+        assert_eq!(out.status.code(), Some(1), "symlink destination must fail");
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            err.contains("not a regular file"),
+            "stderr must say why: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"PRECIOUS DATA",
+            "the symlink target must be untouched"
+        );
+        assert!(
+            dir.join("office.pcap")
+                .symlink_metadata()
+                .unwrap()
+                .is_symlink(),
+            "the planted symlink must not be replaced"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+fn gen_leaves_only_complete_captures_and_no_tmp_debris() {
+    let dir = gen_dir("clean");
+    // Pre-existing regular files are replaced (the documented overwrite),
+    // and stale temp debris from a crashed run must not block regeneration.
+    std::fs::write(dir.join("office.pcap"), b"stale previous capture").unwrap();
+    std::fs::write(dir.join("office.pcap.tmp"), b"debris").unwrap();
+
+    let out = pincer(&["gen", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "gen must succeed in a fresh dir");
+
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["incident.pcap", "office.pcap"],
+        "only the final captures may remain — no .tmp debris"
+    );
+    // The replaced file must hold a complete capture the reader accepts.
+    let summary = pincer(&["summary", dir.join("office.pcap").to_str().unwrap()]);
+    assert!(summary.status.success(), "regenerated capture must parse");
+    std::fs::remove_dir_all(&dir).ok();
+}
