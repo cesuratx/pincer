@@ -9,7 +9,6 @@ use pincer::app::sniff;
 use pincer::decode::decode_packet;
 use pincer::fixtures::scenarios;
 use pincer::pcap::{CaptureReader, LinkType, Record};
-use pincer::types::Timestamp;
 use proptest::prelude::*;
 
 /// Drive arbitrary bytes through the whole pipeline; never panic.
@@ -38,10 +37,11 @@ fn run_pipeline(capture: &[u8]) {
     }
 }
 
-/// A single Ethernet frame decoded directly; never panic.
+/// A single Ethernet frame decoded directly; never panic. `ts: None` keeps
+/// the timestamp-less (SPB) record shape under fuzz too.
 fn decode_frame(frame: &[u8]) {
     let record = Record {
-        ts: Timestamp::ZERO,
+        ts: None,
         orig_len: u32::try_from(frame.len()).unwrap_or(u32::MAX),
         link_type: LinkType::Ethernet,
         data: frame,

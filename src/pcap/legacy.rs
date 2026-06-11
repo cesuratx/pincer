@@ -128,7 +128,7 @@ impl State {
         };
 
         Ok(Some(Record {
-            ts: Timestamp::new(u64::from(ts_sec), nanos),
+            ts: Some(Timestamp::new(u64::from(ts_sec), nanos)),
             orig_len,
             link_type: self.link_type,
             data: buf.get(..incl_len).unwrap_or(&[]),

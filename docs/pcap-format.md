@@ -67,7 +67,9 @@ A sequence of typed, length-prefixed blocks. Every block:
   captured length, original length, then the packet bytes (padded to 4).
   Assuming microseconds globally is the classic pcapng bug.
 - **SPB — Simple Packet Block** (`0x00000003`): original length then packet
-  bytes; no timestamp, no per-interface data.
+  bytes; no timestamp, no per-interface data. The reader surfaces that absence
+  (`Record.ts = None`, counted as `timestampless_records` degradation) rather
+  than fabricating an epoch time.
 
 ## Edge cases the reader handles
 

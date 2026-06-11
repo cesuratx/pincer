@@ -67,7 +67,9 @@ pub enum TransportView<'a> {
 /// One decoded packet. All slices borrow the capture buffer.
 #[derive(Debug)]
 pub struct PacketView<'a> {
-    pub ts: Timestamp,
+    /// Capture time; `None` when the container carried no per-record
+    /// timestamp (pcapng Simple Packet Blocks). Sinks must skip, not invent.
+    pub ts: Option<Timestamp>,
     /// Length on the wire (used for byte accounting).
     pub orig_len: u32,
     /// Bytes actually captured.

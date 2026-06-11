@@ -19,7 +19,7 @@ use pincer::types::{MacAddr, Timestamp};
 
 fn observe_frame(inv: &mut AssetInventory, ts: u64, frame: &[u8]) {
     let record = Record {
-        ts: Timestamp::new(ts, 0),
+        ts: Some(Timestamp::new(ts, 0)),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: frame,
@@ -196,7 +196,7 @@ fn vlan_stack_at_and_beyond_cap() {
         .udp(1000, 2000)
         .payload(b"x");
     let record = Record {
-        ts: Timestamp::ZERO,
+        ts: Some(Timestamp::ZERO),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: &frame,
@@ -215,7 +215,7 @@ fn vlan_stack_at_and_beyond_cap() {
         .udp(1000, 2000)
         .payload(b"x");
     let record = Record {
-        ts: Timestamp::ZERO,
+        ts: Some(Timestamp::ZERO),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: &frame,
@@ -256,7 +256,7 @@ fn synthetic_vlan_and_ipv6_agree_with_etherparse() {
 
     for frame in &frames {
         let record = Record {
-            ts: Timestamp::ZERO,
+            ts: Some(Timestamp::ZERO),
             orig_len: u32::try_from(frame.len()).unwrap(),
             link_type: LinkType::Ethernet,
             data: frame,

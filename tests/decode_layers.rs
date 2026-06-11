@@ -19,7 +19,7 @@ use pincer::types::{MacAddr, Timestamp};
 
 fn record(frame: &[u8]) -> Record<'_> {
     Record {
-        ts: Timestamp::ZERO,
+        ts: Some(Timestamp::ZERO),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: frame,
@@ -168,9 +168,10 @@ fn all_four_legacy_magics_decode_identically() {
         let mut reader = CaptureReader::new(capture.as_slice()).unwrap();
         let rec = reader.next_record().unwrap().expect("one record");
         assert_eq!(rec.data, UDP_FRAME, "magic {magic:02x?}");
-        assert_eq!(rec.ts.secs, 0x6543_2100);
+        assert_eq!(rec.ts.map(|t| t.secs), Some(0x6543_2100));
         assert_eq!(
-            rec.ts.nanos, 123_456_000,
+            rec.ts.map(|t| t.nanos),
+            Some(123_456_000),
             "ns normalization for {magic:02x?}"
         );
         assert!(reader.next_record().unwrap().is_none());
@@ -219,7 +220,7 @@ fn pcapng_with_epb_decodes_the_same_packet() {
     let rec = reader.next_record().unwrap().expect("one EPB record");
     assert_eq!(rec.data, frame);
     assert_eq!(rec.link_type, LinkType::Ethernet);
-    assert_eq!((rec.ts.secs, rec.ts.nanos), (1, 0));
+    assert_eq!(rec.ts.map(|t| (t.secs, t.nanos)), Some((1, 0)));
     assert!(reader.next_record().unwrap().is_none());
 }
 
@@ -269,13 +270,13 @@ fn pcapng_two_sections_mid_stream_shb() {
 
     let mut reader = CaptureReader::new(cap.as_slice()).unwrap();
     let r1 = reader.next_record().unwrap().expect("section 1 packet");
-    assert_eq!(r1.ts.secs, 1);
+    assert_eq!(r1.ts.map(|t| t.secs), Some(1));
     assert_eq!(r1.data, frame);
     let r2 = reader
         .next_record()
         .unwrap()
         .expect("section 2 packet after mid-stream SHB");
-    assert_eq!(r2.ts.secs, 2);
+    assert_eq!(r2.ts.map(|t| t.secs), Some(2));
     assert_eq!(r2.data, frame);
     assert!(reader.next_record().unwrap().is_none());
 }
@@ -379,7 +380,7 @@ fn tcp_options_shift_the_payload_not_the_sniffers() {
         .payload(http);
 
     let record = Record {
-        ts: Timestamp::ZERO,
+        ts: Some(Timestamp::ZERO),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: &frame,

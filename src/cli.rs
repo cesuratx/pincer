@@ -174,6 +174,9 @@ struct Pass {
     /// Well-framed pcapng packet blocks with malformed bodies, skipped by
     /// the reader.
     skipped_blocks: u64,
+    /// Records delivered without a timestamp (pcapng Simple Packet Blocks);
+    /// excluded from every first/last time and duration.
+    timestampless_records: u64,
     /// dns/dhcp detail rows dropped once their per-run cap was hit.
     dns_dropped: u64,
     dhcp_dropped: u64,
@@ -268,8 +271,10 @@ impl Pass {
         }
 
         pass.skipped_blocks = reader.skipped_blocks();
+        pass.timestampless_records = reader.timestampless_records();
         if needs.stats {
             pass.stats.note_skipped_blocks(pass.skipped_blocks);
+            pass.stats.note_timestampless(pass.timestampless_records);
         }
 
         // Resolve provisional bindings so asset keying is order-independent.
@@ -304,6 +309,13 @@ impl Pass {
             warn(format!(
                 "{} malformed packet block(s) were skipped",
                 self.skipped_blocks
+            ));
+        }
+        if self.timestampless_records > 0 {
+            warn(format!(
+                "{} record(s) carry no timestamp (pcapng Simple Packet Block); \
+                 time spans and durations exclude them",
+                self.timestampless_records
             ));
         }
         if self.flows.dropped() > 0 {
@@ -354,6 +366,7 @@ impl Pass {
             dns_records_dropped: self.dns_dropped,
             dhcp_records_dropped: self.dhcp_dropped,
             ips_rebound: of.rebound_ips,
+            timestampless_records: self.timestampless_records,
         }
     }
 }

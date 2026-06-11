@@ -30,7 +30,7 @@ fn every_analysis_subcommand_emits_the_versioned_json_envelope() {
         let json: serde_json::Value =
             serde_json::from_slice(&out.stdout).expect("stdout must be pure JSON");
         assert_eq!(json["tool"], "pincer", "{cmd}: envelope tool field");
-        assert_eq!(json["schema"], "2", "{cmd}: envelope schema version");
+        assert_eq!(json["schema"], "3", "{cmd}: envelope schema version");
         assert_eq!(json["command"], cmd, "{cmd}: envelope discriminator");
         assert!(json.get("data").is_some(), "{cmd}: envelope data field");
         let degradation = json
@@ -99,7 +99,13 @@ fn summary_json_reports_the_anomaly_taxonomy() {
     assert!(out.status.success());
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let anomalies = &json["data"]["anomalies"];
-    for key in ["truncated", "malformed", "undecodable", "skipped_blocks"] {
+    for key in [
+        "truncated",
+        "malformed",
+        "undecodable",
+        "skipped_blocks",
+        "timestampless",
+    ] {
         assert!(
             anomalies.get(key).is_some(),
             "anomalies must carry {key} so partial analysis is machine-detectable"

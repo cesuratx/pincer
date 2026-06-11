@@ -72,6 +72,19 @@ impl Timestamp {
         }
     }
 
+    /// The earlier of two *optional* timestamps. An absent timestamp means
+    /// "no observation", so it must never win — unlike `Option`'s derived
+    /// `Ord`, where `None < Some(_)` would drag a min-fold to "absent".
+    /// (`Option::max` already ignores `None` for the matching last-seen fold.)
+    #[must_use]
+    pub fn min_opt(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, None) => x,
+            (None, y) => y,
+        }
+    }
+
     /// Elapsed seconds since `earlier`, clamped at zero — capture timestamps
     /// are not guaranteed monotonic (multi-interface merges, clock steps).
     #[must_use]

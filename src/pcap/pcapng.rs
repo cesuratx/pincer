@@ -366,7 +366,7 @@ impl State {
 
         let ticks = (u64::from(ts_high) << 32) | u64::from(ts_low);
         Ok(Some(Record {
-            ts: ticks_to_timestamp(ticks, iface.ticks_per_sec),
+            ts: Some(ticks_to_timestamp(ticks, iface.ticks_per_sec)),
             orig_len,
             link_type: iface.link_type,
             data,
@@ -387,7 +387,9 @@ impl State {
             .min(cur.remaining());
         let data = cur.take(want).unwrap_or(&[]);
         Some(Record {
-            ts: Timestamp::ZERO,
+            // The block has no timestamp field; inventing one (the epoch) would
+            // falsify every downstream timeline. Absence stays absent.
+            ts: None,
             orig_len,
             link_type: iface.link_type,
             data,

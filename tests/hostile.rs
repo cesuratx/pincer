@@ -16,7 +16,7 @@ use pincer::types::{MacAddr, Timestamp};
 
 fn decode_observe<O: Observe>(sink: &mut O, frame: &[u8]) {
     let record = Record {
-        ts: Timestamp::ZERO,
+        ts: Some(Timestamp::ZERO),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: frame,
@@ -401,6 +401,241 @@ mod pcapng_hostile {
         let mut reader = CaptureReader::new(file.as_slice()).unwrap();
         let record = reader.next_record().unwrap().expect("EPB must survive");
         assert_eq!(record.data, &[1, 2, 3, 4]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SPB timestamp integrity: a Simple Packet Block carries NO timestamp. The
+// reader must surface that absence (never fabricate the 1970 epoch), the
+// sinks must exclude such records from every first/last fold, and the
+// degradation channel — stderr, summary note, JSON envelope — must count
+// them. A forensic timeline silently anchored at 1970 is falsified evidence.
+// ---------------------------------------------------------------------------
+
+mod spb_timestamps {
+    use std::net::Ipv4Addr;
+    use std::process::{Command, Output};
+
+    use pincer::pcap::CaptureReader;
+    use pincer::types::MacAddr;
+
+    fn shb_le() -> Vec<u8> {
+        let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b.extend_from_slice(&0x1A2B_3C4Du32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&(-1i64).to_le_bytes());
+        b.extend_from_slice(&28u32.to_le_bytes());
+        b
+    }
+
+    fn idb_le() -> Vec<u8> {
+        let mut b = 1u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b
+    }
+
+    /// EPB stamped at `ticks` µs since the epoch (the IDB default resolution).
+    fn epb_le(ticks: u64, data: &[u8]) -> Vec<u8> {
+        let cap = u32::try_from(data.len()).unwrap();
+        let padded = data.len().next_multiple_of(4);
+        let total = u32::try_from(32 + padded).unwrap();
+        let mut b = 6u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&total.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // interface_id
+        b.extend_from_slice(&u32::try_from(ticks >> 32).unwrap().to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        b.extend_from_slice(&(ticks as u32).to_le_bytes());
+        b.extend_from_slice(&cap.to_le_bytes());
+        b.extend_from_slice(&cap.to_le_bytes());
+        b.extend_from_slice(data);
+        b.resize(b.len() + (padded - data.len()), 0);
+        b.extend_from_slice(&total.to_le_bytes());
+        b
+    }
+
+    /// SPB: original length, then data padded to 4 bytes — no timestamp field.
+    fn spb_le(data: &[u8]) -> Vec<u8> {
+        let padded = data.len().next_multiple_of(4);
+        let total = u32::try_from(16 + padded).unwrap();
+        let mut b = 3u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&total.to_le_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+        b.extend_from_slice(data);
+        b.resize(b.len() + (padded - data.len()), 0);
+        b.extend_from_slice(&total.to_le_bytes());
+        b
+    }
+
+    /// A decodable UDP frame so the analysis sinks actually fold the record.
+    fn udp_frame(src_port: u16) -> Vec<u8> {
+        pincer::fixtures::Packet::ethernet(MacAddr([2, 0, 0, 0, 0, 1]), MacAddr([2, 0, 0, 0, 0, 2]))
+            .ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2))
+            .udp(src_port, 53)
+            .payload(b"x")
+    }
+
+    /// Write a capture to a temp file and run the real binary on it.
+    fn run_on(tag: &str, capture: &[u8], args: &[&str]) -> Output {
+        let path = std::env::temp_dir().join(format!("pincer-{tag}-{}.pcapng", std::process::id()));
+        std::fs::write(&path, capture).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_pincer"))
+            .args(args)
+            .arg(&path)
+            .output()
+            .expect("binary must run");
+        std::fs::remove_file(&path).ok();
+        out
+    }
+
+    /// The reader carries timestamp absence in the type and counts it — it
+    /// never invents an epoch value for a block that has no timestamp field.
+    #[test]
+    fn spb_records_surface_timestamp_absence() {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        file.extend_from_slice(&spb_le(&udp_frame(40000)));
+        file.extend_from_slice(&spb_le(&udp_frame(40001)));
+        let mut reader = CaptureReader::new(file.as_slice()).unwrap();
+        for _ in 0..2 {
+            let rec = reader.next_record().unwrap().expect("SPB record");
+            assert_eq!(rec.ts, None, "an SPB has no timestamp to report");
+        }
+        assert!(reader.next_record().unwrap().is_none());
+        assert_eq!(reader.timestampless_records(), 2, "absence must be counted");
+    }
+
+    /// A pure-SPB capture must report honest absence — null times, zero
+    /// duration, a degradation count, exit 0 — and never a 1970 date.
+    #[test]
+    fn pure_spb_capture_reports_no_epoch_dates() {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        file.extend_from_slice(&spb_le(&udp_frame(40000)));
+        file.extend_from_slice(&spb_le(&udp_frame(40001)));
+
+        let out = run_on("pure-spb-json", &file, &["summary", "--json"]);
+        assert!(out.status.success(), "degraded is not broken: exit 0");
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let data = json.get("data").unwrap();
+        assert!(
+            data.get("first_ts").unwrap().is_null(),
+            "no fabricated start"
+        );
+        assert!(data.get("last_ts").unwrap().is_null(), "no fabricated end");
+        assert_eq!(data.get("duration_secs").unwrap().as_f64(), Some(0.0));
+        assert_eq!(
+            data.pointer("/anomalies/timestampless")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            json.pointer("/degradation/timestampless_records")
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "the envelope must say the timeline is missing"
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !stdout.contains("1970"),
+            "no epoch dates anywhere: {stdout}"
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("no timestamp"),
+            "stderr must warn about the missing timeline: {stderr}"
+        );
+
+        let out = run_on("pure-spb-table", &file, &["summary"]);
+        assert!(out.status.success());
+        let table = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !table.contains("1970"),
+            "no epoch dates in the table: {table}"
+        );
+        assert!(
+            table.contains("carry no timestamp"),
+            "the table must note the missing timeline: {table}"
+        );
+
+        // Flows built only from SPB records have no honest times either.
+        let out = run_on("pure-spb-flows", &file, &["flows", "--json"]);
+        assert!(out.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let flow = json.pointer("/data/0").expect("one flow");
+        assert!(flow.get("first_ts").unwrap().is_null());
+        assert!(flow.get("last_ts").unwrap().is_null());
+        assert!(!String::from_utf8(out.stdout).unwrap().contains("1970"));
+    }
+
+    /// Mixing EPBs (real clock) with SPBs (no clock) must not drag the span
+    /// to the epoch: the audit's 1-EPB+1-SPB capture reported a ~31.7-year
+    /// duration. The duration comes from the timestamped records alone.
+    #[test]
+    fn mixed_epb_spb_does_not_inflate_duration() {
+        let base_us = 1_000_000_000u64 * 1_000_000; // 2001-09-09, in µs ticks
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        file.extend_from_slice(&epb_le(base_us, &udp_frame(40000)));
+        file.extend_from_slice(&spb_le(&udp_frame(40001)));
+        file.extend_from_slice(&epb_le(base_us + 100_000_000, &udp_frame(40002)));
+
+        let out = run_on("mixed-epb-spb", &file, &["summary", "--json"]);
+        assert!(out.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let data = json.get("data").unwrap();
+        let duration = data.get("duration_secs").unwrap().as_f64().unwrap();
+        assert!(
+            (duration - 100.0).abs() < 1e-6,
+            "duration must span the timestamped records only, got {duration}"
+        );
+        assert!(
+            data.get("first_ts")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("2001-"),
+            "first_ts must be the first real timestamp"
+        );
+        assert_eq!(
+            data.get("clock_inconsistent").unwrap().as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            json.pointer("/degradation/timestampless_records")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    /// The >5-year span heuristic must reach JSON consumers, not only the
+    /// table note — and only for genuinely inconsistent capture clocks (two
+    /// EPBs years apart), which SPB zeroing can no longer fake.
+    #[test]
+    fn clock_inconsistency_is_machine_readable() {
+        let mut file = shb_le();
+        file.extend_from_slice(&idb_le());
+        file.extend_from_slice(&epb_le(1_000_000_000u64 * 1_000_000, &udp_frame(40000)));
+        file.extend_from_slice(&epb_le(1_200_000_000u64 * 1_000_000, &udp_frame(40001)));
+
+        let out = run_on("clock-skew-json", &file, &["summary", "--json"]);
+        assert!(out.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            json.pointer("/data/clock_inconsistent")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a years-long span must flag the clock for JSON consumers too"
+        );
+
+        let out = run_on("clock-skew-table", &file, &["summary"]);
+        let table = String::from_utf8(out.stdout).unwrap();
+        assert!(table.contains("exceeds 5 years"), "table keeps its note");
     }
 }
 

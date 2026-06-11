@@ -24,7 +24,7 @@ use proptest::prelude::*;
 
 fn observe_frame<O: Observe>(sink: &mut O, ts: Timestamp, frame: &[u8]) {
     let record = Record {
-        ts,
+        ts: Some(ts),
         orig_len: u32::try_from(frame.len()).unwrap(),
         link_type: LinkType::Ethernet,
         data: frame,
@@ -78,7 +78,7 @@ fn flow_bytes_match_packet_bytes() {
     let mut expected: u64 = 0;
     for (ts, frame) in &frames {
         let record = Record {
-            ts: *ts,
+            ts: Some(*ts),
             orig_len: u32::try_from(frame.len()).unwrap(),
             link_type: LinkType::Ethernet,
             data: frame,
@@ -293,7 +293,7 @@ fn stats_counts_are_consistent() {
     let mut decoded = 0u64;
     for (ts, frame) in scenarios::incident() {
         let record = Record {
-            ts,
+            ts: Some(ts),
             orig_len: u32::try_from(frame.len()).unwrap(),
             link_type: LinkType::Ethernet,
             data: &frame,

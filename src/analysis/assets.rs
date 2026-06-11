@@ -99,8 +99,10 @@ pub struct Asset {
     services: BTreeMap<(u16, &'static str), ServiceEvidence>,
     pub dhcp_fingerprint: Option<String>,
     pub vendor_class: Option<String>,
-    pub first_seen: Timestamp,
-    pub last_seen: Timestamp,
+    /// `None` when every sighting came from timestamp-less records (pcapng
+    /// SPB) — absent, not the epoch.
+    pub first_seen: Option<Timestamp>,
+    pub last_seen: Option<Timestamp>,
 }
 
 /// Render the service map as the historical `Vec<Service>` JSON shape.
@@ -122,7 +124,7 @@ fn serialize_services<S: serde::Serializer>(
 }
 
 impl Asset {
-    fn new(key: AssetKey, ts: Timestamp) -> Self {
+    fn new(key: AssetKey, ts: Option<Timestamp>) -> Self {
         Self {
             key,
             macs: BTreeSet::new(),
@@ -169,7 +171,7 @@ impl Asset {
         }
         self.dhcp_fingerprint = self.dhcp_fingerprint.take().or(other.dhcp_fingerprint);
         self.vendor_class = self.vendor_class.take().or(other.vendor_class);
-        self.first_seen = self.first_seen.min(other.first_seen);
+        self.first_seen = Timestamp::min_opt(self.first_seen, other.first_seen);
         self.last_seen = self.last_seen.max(other.last_seen);
         (dropped_names, dropped_services, dropped_ips)
     }
@@ -317,7 +319,7 @@ pub struct AssetInventory {
     /// *final* subnet knowledge in [`AssetInventory::finalize`]. This is what
     /// makes keying order-independent: a host whose frames arrive before the
     /// ARP/DHCP that establishes its subnet is still MAC-keyed at the end.
-    provisional: BTreeMap<IpAddr, (MacAddr, Timestamp)>,
+    provisional: BTreeMap<IpAddr, (MacAddr, Option<Timestamp>)>,
     finalized: bool,
     limits: Limits,
     overflow: AssetOverflow,
@@ -378,7 +380,7 @@ impl AssetInventory {
         self.finalized = true;
         // Snapshot to satisfy the borrow checker; provisional is bounded by
         // max_bindings, so this is a small, one-time pass.
-        let pending: Vec<(IpAddr, MacAddr, Timestamp)> = self
+        let pending: Vec<(IpAddr, MacAddr, Option<Timestamp>)> = self
             .provisional
             .iter()
             .filter(|(ip, _)| !self.ip_to_mac.contains_key(ip) && self.is_local(**ip))
@@ -512,7 +514,7 @@ impl AssetInventory {
     /// Note a candidate IP→MAC pair seen on a data frame. Unlike [`bind`],
     /// this makes no locality claim yet — [`finalize`] decides, once all
     /// subnets are known. Bounded by `max_bindings`.
-    fn record_provisional(&mut self, mac: MacAddr, ip: IpAddr, ts: Timestamp) {
+    fn record_provisional(&mut self, mac: MacAddr, ip: IpAddr, ts: Option<Timestamp>) {
         if mac == MacAddr::BROADCAST || mac.is_multicast() || mac == MacAddr::ZERO {
             return;
         }
@@ -528,7 +530,7 @@ impl AssetInventory {
         }
         self.provisional
             .entry(ip)
-            .and_modify(|(_, seen)| *seen = (*seen).min(ts))
+            .and_modify(|(_, seen)| *seen = Timestamp::min_opt(*seen, ts))
             .or_insert((mac, ts));
     }
 
@@ -606,7 +608,7 @@ impl AssetInventory {
     /// Get or create an asset. Returns `None` when the inventory is at
     /// `max_assets` and this is a new identity — a random-source-IP flood then
     /// stops creating assets (counted) instead of exhausting memory.
-    fn asset_mut(&mut self, key: AssetKey, ts: Timestamp) -> Option<&mut Asset> {
+    fn asset_mut(&mut self, key: AssetKey, ts: Option<Timestamp>) -> Option<&mut Asset> {
         if !self.assets.contains_key(&key) && self.assets.len() >= self.limits.max_assets {
             self.overflow.assets = self.overflow.assets.saturating_add(1);
             return None;
@@ -618,7 +620,7 @@ impl AssetInventory {
         )
     }
 
-    fn record_local_host(&mut self, mac: MacAddr, ip: Option<IpAddr>, ts: Timestamp) {
+    fn record_local_host(&mut self, mac: MacAddr, ip: Option<IpAddr>, ts: Option<Timestamp>) {
         if mac == MacAddr::BROADCAST || mac.is_multicast() || mac == MacAddr::ZERO {
             return;
         }
@@ -628,7 +630,7 @@ impl AssetInventory {
         };
         asset.macs.insert(mac);
         asset.last_seen = asset.last_seen.max(ts);
-        asset.first_seen = asset.first_seen.min(ts);
+        asset.first_seen = Timestamp::min_opt(asset.first_seen, ts);
         let dropped = ip
             .filter(|ip| !ip.is_unspecified() && !ip.is_multicast())
             .is_some_and(|ip| asset.add_ip(ip, cap));
@@ -637,7 +639,7 @@ impl AssetInventory {
         }
     }
 
-    fn observe_arp(&mut self, arp: &ArpView, ts: Timestamp) {
+    fn observe_arp(&mut self, arp: &ArpView, ts: Option<Timestamp>) {
         // Unknown opcodes carry the right field layout but unknowable
         // semantics — no trust.
         if !matches!(arp.op, ArpOp::Request | ArpOp::Reply) {
@@ -658,7 +660,7 @@ impl AssetInventory {
         }
     }
 
-    fn observe_app(&mut self, pkt: &PacketView<'_>, app: &AppEvent, ts: Timestamp) {
+    fn observe_app(&mut self, pkt: &PacketView<'_>, app: &AppEvent, ts: Option<Timestamp>) {
         match app {
             AppEvent::Dhcp(dhcp) => {
                 // A relayed exchange (giaddr set) describes a client on a
@@ -769,7 +771,7 @@ impl AssetInventory {
         key: AssetKey,
         name: String,
         source: NameSource,
-        ts: Timestamp,
+        ts: Option<Timestamp>,
     ) {
         let cap = self.limits.max_hostnames_per_asset;
         let dropped = match self.asset_mut(key, ts) {
@@ -790,7 +792,7 @@ impl AssetInventory {
         port: u16,
         proto: &'static str,
         evidence: ServiceEvidence,
-        ts: Timestamp,
+        ts: Option<Timestamp>,
     ) {
         let cap = self.limits.max_services_per_asset;
         let dropped = match self.asset_mut(key, ts) {
@@ -986,7 +988,7 @@ mod tests {
             .udp(68, 67)
             .payload(&crate::fixtures::dhcp(msg_type, mac, 0x42, opts));
         let record = crate::pcap::Record {
-            ts: Timestamp::ZERO,
+            ts: Some(Timestamp::ZERO),
             orig_len: u32::try_from(frame.len()).unwrap_or(0),
             link_type: crate::pcap::LinkType::Ethernet,
             data: &frame,
@@ -1049,7 +1051,7 @@ mod tests {
         let mut inv = AssetInventory::new();
         let mac = MacAddr([0x3C, 0, 0, 0, 0, 9]);
         let ip = v4(192, 168, 7, 42);
-        inv.record_provisional(mac, ip, Timestamp::new(100, 0));
+        inv.record_provisional(mac, ip, Some(Timestamp::new(100, 0)));
         inv.learn_subnet(Ipv4Addr::new(192, 168, 7, 1), 0xFFFF_FF00);
         inv.finalize();
         let assets = inv.assets();
@@ -1058,7 +1060,7 @@ mod tests {
             .find(|a| a.key == AssetKey::Mac(mac))
             .unwrap_or_else(|| unreachable!("host must appear in the inventory"));
         assert!(asset.ips.contains(&ip));
-        assert_eq!(asset.first_seen, Timestamp::new(100, 0));
+        assert_eq!(asset.first_seen, Some(Timestamp::new(100, 0)));
     }
 
     #[test]
@@ -1115,7 +1117,7 @@ mod tests {
     /// the real pipeline takes.
     fn observe_frame(inv: &mut AssetInventory, frame: &[u8]) {
         let record = crate::pcap::Record {
-            ts: Timestamp::ZERO,
+            ts: Some(Timestamp::ZERO),
             orig_len: u32::try_from(frame.len()).unwrap_or(0),
             link_type: crate::pcap::LinkType::Ethernet,
             data: frame,

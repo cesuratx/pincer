@@ -30,7 +30,14 @@ pub struct Stats {
     /// Well-framed pcapng packet blocks whose bodies were malformed; each
     /// was skipped by the reader instead of aborting the stream.
     pub skipped_blocks: u64,
+    /// Records that carry no capture timestamp (pcapng Simple Packet
+    /// Blocks); excluded from the first/last span and the duration.
+    pub timestampless_records: u64,
 }
+
+/// Some capture tools mix uptime-relative and absolute clocks; a span
+/// measured in years is a data-quality problem worth saying out loud.
+const FIVE_YEARS_SECS: f64 = 5.0 * 365.25 * 86_400.0;
 
 impl Stats {
     #[must_use]
@@ -45,6 +52,14 @@ impl Stats {
             (Some(first), Some(last)) => last.secs_since(first),
             _ => 0.0,
         }
+    }
+
+    /// The observed span is too long (> 5 years) to be one consistent capture
+    /// clock. A heuristic data-quality flag, surfaced in the table note and
+    /// the summary JSON alike.
+    #[must_use]
+    pub fn clock_inconsistent(&self) -> bool {
+        self.duration_secs() > FIVE_YEARS_SECS
     }
 
     fn bump(map: &mut BTreeMap<&'static str, u64>, key: &'static str) {
@@ -74,8 +89,12 @@ impl Observe for Stats {
     fn observe(&mut self, pkt: &PacketView<'_>, app: Option<&AppEvent>) {
         self.packets = self.packets.saturating_add(1);
         self.bytes = self.bytes.saturating_add(u64::from(pkt.orig_len));
-        self.first_ts = Some(self.first_ts.map_or(pkt.ts, |t| t.min(pkt.ts)));
-        self.last_ts = Some(self.last_ts.map_or(pkt.ts, |t| t.max(pkt.ts)));
+        // A record without a timestamp contributes nothing to the span —
+        // folding a sentinel in would fabricate a 1970 capture start.
+        if let Some(ts) = pkt.ts {
+            self.first_ts = Some(self.first_ts.map_or(ts, |t| t.min(ts)));
+            self.last_ts = Some(self.last_ts.map_or(ts, |t| t.max(ts)));
+        }
 
         if pkt.truncated {
             self.truncated_packets = self.truncated_packets.saturating_add(1);
@@ -136,5 +155,9 @@ impl Stats {
 
     pub fn note_skipped_blocks(&mut self, n: u64) {
         self.skipped_blocks = self.skipped_blocks.saturating_add(n);
+    }
+
+    pub fn note_timestampless(&mut self, n: u64) {
+        self.timestampless_records = self.timestampless_records.saturating_add(n);
     }
 }

@@ -330,6 +330,14 @@ inventory order-independent.
   Host instead. The residual exposure — an on-segment attacker naming an
   on-segment neighbor — is indistinguishable from a legitimate local resolver
   by passive evidence alone.
+- **Timestamp absence is typed, not faked** — a pcapng Simple Packet Block
+  carries no timestamp, so `Record.ts` (and `PacketView.ts`) is
+  `Option<Timestamp>`. SPB records are excluded from every first/last fold and
+  from `duration_secs` (no fabricated 1970 epoch in flows, assets, or the
+  summary), and counted as `timestampless_records` in the degradation
+  envelope, a summary note, and a stderr warning. A >5-year timestamp span —
+  now only producible by genuinely inconsistent capture clocks — surfaces as
+  `clock_inconsistent` in summary JSON, not just the table note.
 - **Offload-capture quirks are handled, not punted**: IPv4 `total_length == 0`
   and IPv6 `payload_length == 0` (TSO/GSO captures taken on the sending host,
   plus v6 jumbograms) decode using the captured bytes instead of being dropped

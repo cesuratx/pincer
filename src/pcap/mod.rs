@@ -56,7 +56,10 @@ impl LinkType {
 /// One captured packet, borrowing the reader's buffer.
 #[derive(Debug)]
 pub struct Record<'a> {
-    pub ts: Timestamp,
+    /// Capture time, or `None` when the container records none (pcapng
+    /// Simple Packet Blocks carry no timestamp). Absence lives in the type so
+    /// no consumer can mistake "never timestamped" for the 1970 epoch.
+    pub ts: Option<Timestamp>,
     /// Original length on the wire; `data.len()` may be smaller (snaplen).
     pub orig_len: u32,
     pub link_type: LinkType,
@@ -80,6 +83,9 @@ pub struct CaptureReader<R> {
     /// Well-framed packet blocks skipped because their body was malformed
     /// (pcapng only). Surfaced so damaged input is never silently dropped.
     skipped_blocks: u64,
+    /// Records delivered without a timestamp (pcapng Simple Packet Blocks).
+    /// Surfaced so time-less data degrades the report visibly, never silently.
+    timestampless_records: u64,
 }
 
 impl<R: Read> CaptureReader<R> {
@@ -120,6 +126,7 @@ impl<R: Read> CaptureReader<R> {
             // both formats (a pcapng SHB is 28+ bytes, not 24).
             offset: header_len,
             skipped_blocks: 0,
+            timestampless_records: 0,
         })
     }
 
@@ -130,19 +137,31 @@ impl<R: Read> CaptureReader<R> {
         self.skipped_blocks
     }
 
+    /// Records delivered without a timestamp (pcapng Simple Packet Blocks).
+    #[must_use]
+    pub fn timestampless_records(&self) -> u64 {
+        self.timestampless_records
+    }
+
     /// Next packet, or `Ok(None)` at clean end-of-file.
     pub fn next_record(&mut self) -> Result<Option<Record<'_>>, PcapError> {
-        match &mut self.format {
+        let record = match &mut self.format {
             Format::Legacy(state) => {
-                state.next_record(&mut self.reader, &mut self.buf, &mut self.offset)
+                state.next_record(&mut self.reader, &mut self.buf, &mut self.offset)?
             }
             Format::Ng(state) => state.next_record(
                 &mut self.reader,
                 &mut self.buf,
                 &mut self.offset,
                 &mut self.skipped_blocks,
-            ),
+            )?,
+        };
+        // Counted at the single exit so every delivered record is covered,
+        // whichever format produced it.
+        if matches!(&record, Some(rec) if rec.ts.is_none()) {
+            self.timestampless_records = self.timestampless_records.saturating_add(1);
         }
+        Ok(record)
     }
 }
 

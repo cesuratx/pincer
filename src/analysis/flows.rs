@@ -89,8 +89,10 @@ pub struct Flow {
     a_to_b: DirStats,
     b_to_a: DirStats,
     pub tcp_flags: TcpFlags,
-    pub first_ts: Timestamp,
-    pub last_ts: Timestamp,
+    /// `None` until a timestamped packet lands on the flow — a flow built
+    /// only from timestamp-less records (pcapng SPB) has no honest times.
+    pub first_ts: Option<Timestamp>,
+    pub last_ts: Option<Timestamp>,
     /// First application protocol identified on this flow.
     app_label: Option<&'static str>,
     /// First server-name evidence seen (TLS SNI / HTTP Host). One small owned
@@ -99,7 +101,7 @@ pub struct Flow {
 }
 
 impl Flow {
-    fn new(key: FlowKey, dir: Direction, ts: Timestamp) -> Self {
+    fn new(key: FlowKey, dir: Direction, ts: Option<Timestamp>) -> Self {
         Self {
             key,
             first_dir: dir,
@@ -328,7 +330,9 @@ impl Observe for FlowTable {
         let stats = flow.stats_mut(dir);
         stats.packets = stats.packets.saturating_add(1);
         stats.bytes = stats.bytes.saturating_add(u64::from(pkt.orig_len));
-        flow.first_ts = flow.first_ts.min(pkt.ts);
+        // min_opt because a timestamp-less packet must not drag first_ts to
+        // "absent"; Option's own max already ignores None on the last_ts side.
+        flow.first_ts = Timestamp::min_opt(flow.first_ts, pkt.ts);
         flow.last_ts = flow.last_ts.max(pkt.ts);
 
         if let Some(flags) = tcp_flags {
@@ -380,7 +384,7 @@ mod tests {
         // Server on a high (non-well-known) port: only the SYN reveals who
         // initiated. We send the SYN from the high-port side.
         let key = FlowKey::new(ep(10, 40000), ep(50, 40001), IpProto::Tcp);
-        let mut flow = Flow::new(key, Direction::AToB, Timestamp::ZERO);
+        let mut flow = Flow::new(key, Direction::AToB, None);
         flow.syn_dir = Some(if key.a() == ep(10, 40000) {
             Direction::AToB
         } else {
@@ -393,7 +397,7 @@ mod tests {
     #[test]
     fn well_known_port_breaks_tie_without_syn() {
         let key = FlowKey::new(ep(10, 51000), ep(50, 22), IpProto::Tcp);
-        let flow = Flow::new(key, Direction::BToA, Timestamp::ZERO);
+        let flow = Flow::new(key, Direction::BToA, None);
         // No SYN seen; port 22 marks the server side regardless of first packet.
         assert_eq!(flow.server().port, 22);
         assert_eq!(flow.client().port, 51000);

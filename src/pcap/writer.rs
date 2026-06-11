@@ -73,7 +73,7 @@ mod tests {
         assert_eq!(record.data, frame);
         assert_eq!(record.orig_len, 60);
         assert_eq!(record.link_type, LinkType::Ethernet);
-        assert_eq!(record.ts, Timestamp::new(1_781_049_600, 123_456_000));
+        assert_eq!(record.ts, Some(Timestamp::new(1_781_049_600, 123_456_000)));
         assert!(reader.next_record().unwrap().is_none());
     }
 

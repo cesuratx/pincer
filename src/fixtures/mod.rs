@@ -670,7 +670,7 @@ mod tests {
 
     fn decode(frame: &[u8]) -> crate::decode::PacketView<'_> {
         decode_packet(&Record {
-            ts: Timestamp::ZERO,
+            ts: Some(Timestamp::ZERO),
             orig_len: u32::try_from(frame.len()).unwrap(),
             link_type: LinkType::Ethernet,
             data: frame,

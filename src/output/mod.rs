@@ -100,8 +100,12 @@ impl DhcpRecord {
 }
 
 /// Stable JSON envelope version. Bump on any breaking change to the `data`
-/// shapes so consumers can version-lock.
-pub const JSON_SCHEMA_VERSION: &str = "2";
+/// shapes so consumers can version-lock. v3: flow `first_ts`/`last_ts` and
+/// asset `first_seen`/`last_seen` are `null` when every sighting came from
+/// timestamp-less records (pcapng SPB) — previously a fabricated 1970 epoch;
+/// summary gains `clock_inconsistent` and `anomalies.timestampless`, and the
+/// degradation envelope gains `timestampless_records`.
+pub const JSON_SCHEMA_VERSION: &str = "3";
 
 /// Machine-readable record of everything that degraded this analysis —
 /// damaged input, skipped blocks, caps hit. Mirrors the stderr warnings so a
@@ -128,6 +132,9 @@ pub struct Degradation {
     /// IPs whose MAC binding changed mid-capture — flow attribution for them
     /// uses the final binding and is therefore ambiguous.
     pub ips_rebound: u64,
+    /// Records that carry no capture timestamp (pcapng Simple Packet
+    /// Blocks); every first/last time and duration excludes them.
+    pub timestampless_records: u64,
 }
 
 impl Report<'_> {
@@ -171,6 +178,9 @@ impl Report<'_> {
                 "duration_secs": stats.duration_secs(),
                 "first_ts": stats.first_ts,
                 "last_ts": stats.last_ts,
+                // The same data-quality signal the table note carries — a
+                // machine consumer must not have to re-derive it from the span.
+                "clock_inconsistent": stats.clock_inconsistent(),
                 "link_protocols": stats.link_protocols,
                 "transport_protocols": stats.transport_protocols,
                 "app_protocols": stats.app_protocols,
@@ -179,6 +189,7 @@ impl Report<'_> {
                     "malformed": stats.malformed_packets,
                     "undecodable": stats.undecodable,
                     "skipped_blocks": stats.skipped_blocks,
+                    "timestampless": stats.timestampless_records,
                 },
             }),
             Self::Flows(flows) => {
@@ -281,10 +292,6 @@ pub fn deps_dot(edges: &[DepEdge]) -> String {
     dot
 }
 
-/// Some capture tools mix uptime-relative and absolute clocks; a span
-/// measured in years is a data-quality problem worth saying out loud.
-const FIVE_YEARS_SECS: f64 = 5.0 * 365.25 * 86_400.0;
-
 fn render_summary(stats: &Stats) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "packets   {}", stats.packets);
@@ -293,12 +300,20 @@ fn render_summary(stats: &Stats) -> String {
     if let (Some(first), Some(last)) = (stats.first_ts, stats.last_ts) {
         let _ = writeln!(out, "from      {first}");
         let _ = writeln!(out, "to        {last}");
-        if stats.duration_secs() > FIVE_YEARS_SECS {
+        if stats.clock_inconsistent() {
             let _ = writeln!(
                 out,
                 "note      timestamp span exceeds 5 years — capture clock looks inconsistent"
             );
         }
+    }
+    if stats.timestampless_records > 0 {
+        let _ = writeln!(
+            out,
+            "note      {} record(s) carry no timestamp (pcapng Simple Packet Block); \
+             time span and duration exclude them",
+            stats.timestampless_records
+        );
     }
     let proto_line = |label: &str, map: &std::collections::BTreeMap<&'static str, u64>| {
         let mut parts: Vec<(&str, u64)> = map.iter().map(|(k, v)| (*k, *v)).collect();
