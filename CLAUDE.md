@@ -20,11 +20,12 @@ cargo run -- summary testdata/office.pcap     # try a subcommand
 Subcommands: `summary`, `flows`, `assets`, `services`, `deps` (`--dot` for
 Graphviz), `dns`, `dhcp`, `gen`. Every analysis subcommand accepts `--json`,
 and `-` as the file argument streams from stdin (`gzcat big.pcap.gz | pincer
-flows -`). Hostile-flood caps live in `analysis::Limits`; cap drops and other
-degradation are reported on stderr, in the JSON envelope (whose `degradation`
-field always precedes `data` in the byte stream), in the `# pincer: …
-complete|PARTIAL` table footer, and as a `// pincer: PARTIAL` header on
-degraded DOT. The global `--strict` flag turns any degradation into exit 3
+flows -`). Hostile-flood caps live in `analysis::Limits`; they evict by key
+order (the N smallest keys survive), so even a cap-saturated report is
+order-independent and diffable. Cap drops and other degradation are reported
+on stderr, in the JSON envelope (whose `degradation` field always precedes
+`data` in the byte stream), in the `# pincer: … complete|PARTIAL` table
+footer, and as a `// pincer: PARTIAL` header on degraded DOT. The global `--strict` flag turns any degradation into exit 3
 (default stays exit 0). JSON renders by streaming (`Report::write_json`);
 tables/DOT still materialize their string.
 
@@ -63,7 +64,8 @@ sync (a test enforces byte-identity).
 
 - No IP fragment reassembly. Non-first fragments are excluded from transport parsing.
 - No TCP stream reassembly. HTTP/TLS detection works on the **first** data segment of a connection; otherwise the flow degrades to port + SYN-ACK evidence.
-- MAC↔IP binding is gated on L2 locality (a router's MAC fronts many off-link IPs); off-link hosts are keyed by IP. Local segments come from DHCP option 1 (real mask) or ARP (/24 guess); no RFC-1918 fallback (it made keying order-dependent). ARP-only wide subnets and global IPv6 are documented limitations. See `analysis/assets.rs`.
+- MAC↔IP binding is gated on L2 locality (a router's MAC fronts many off-link IPs); off-link hosts are keyed by IP. Local segments come from DHCP option 1 (real mask) or ARP (/24 guess); no RFC-1918 fallback (it made keying order-dependent). Data frames bind and enter the inventory only at `finalize()`, against the complete segment set. ARP-only wide subnets and global IPv6 are documented limitations. See `analysis/assets.rs`.
+- Cap survivors are order-independent (smallest-N keys; permutation proptests in `tests/determinism.rs`), but under an engaged cap the overflow-counter *values* tally capped events (order may vary), and evidence already merged through a later-evicted binding/asset cannot be unmerged. Degradation signals always fire when a cap engages.
 - DNS/mDNS hostname evidence is trust-gated: answer records count only in responses (qr=1), and only when the record names the speaker itself or a host on the same learned local segment. A resolver's answers for off-segment IPs are not attributed — off-link assets get names from TLS SNI / HTTP Host instead.
 
 ## Where to learn the formats

@@ -212,9 +212,10 @@ fn normal_traffic_never_triggers_caps() {
 
 /// One MAC spraying fresh IPv6 link-local *sources* — local by definition,
 /// with no subnet learning and no ARP/DHCP needed — must not grow its single
-/// asset's IP set with the streamed file. `max_bindings` does not bound this
-/// path: `record_local_host` runs even when `bind()` dropped at its cap, so
-/// the per-asset `max_ips_per_asset` cap has to hold on its own.
+/// asset's IP set. The provisional-candidate cap (`max_bindings`) bounds how
+/// many sightings reach `finalize`, and the per-asset `max_ips_per_asset`
+/// cap has to hold on its own below that (ARP claims still reach
+/// `record_local_host` per packet even when `bind()` dropped at its cap).
 #[test]
 fn ipv6_link_local_source_flood_respects_per_asset_ip_cap() {
     let mut assets = AssetInventory::with_limits(Limits::tiny()); // max_ips_per_asset = 4
@@ -229,6 +230,9 @@ fn ipv6_link_local_source_flood_respects_per_asset_ip_cap() {
             .payload(b"x");
         decode_observe(&mut assets, &frame);
     }
+    // Data-frame hosts enter the inventory at finalize, as in the real
+    // pipeline.
+    assets.finalize();
     let asset = assets
         .assets()
         .into_iter()

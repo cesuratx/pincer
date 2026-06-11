@@ -349,9 +349,13 @@ subtlety a passive-discovery product lives and dies on.
 Residual limitations, stated honestly in the code: an ARP-only network wider
 than /24 may IP-key a same-segment host in another /24; IPv6 locality covers
 link-local/ULA only (global SLAAC needs NDP parsing we don't do). The deeper
-fix — a two-phase resolve that collects candidate bindings during the pass and
+fix — a two-phase resolve that collects candidate sightings during the pass and
 keys them once at the end, against the complete segment set — is implemented:
-`record_provisional` collects, `finalize()` resolves, which is what makes the
+`record_provisional` collects, `finalize()` resolves, and data frames bind or
+enter the inventory **only** there (a per-packet locality decision made a
+host's membership and keying depend on whether its frames preceded the
+ARP/DHCP that taught its segment). ARP/DHCP stay immediate — they speak
+authoritatively about their own segment. This deferral is what makes the
 inventory order-independent.
 
 ### Honest limitations, stated not hidden
@@ -372,6 +376,21 @@ inventory order-independent.
   Host instead. The residual exposure — an on-segment attacker naming an
   on-segment neighbor — is indistinguishable from a legitimate local resolver
   by passive evidence alone.
+- **Caps evict deterministically** — every `analysis::Limits` collection
+  (flows, assets, bindings, candidate sightings, subnets, and the per-asset
+  hostname/service/IP sets) admits by key order once full: a new key replaces
+  the largest admitted one only if it sorts before it, so the survivors are
+  always the N smallest keys the capture offered — identical across packet
+  reorderings — and `flows_dropped` counts exactly the packets of flows
+  missing from the final table. Permutation proptests pin this
+  (tests/determinism.rs: shuffled cap-exceeding captures must render
+  byte-identical reports). Residual order dependence under an engaged cap,
+  stated rather than implied away: evidence already merged through a binding
+  or asset that a smaller key later evicts cannot be unmerged (such a host can
+  split into MAC- and IP-keyed records), and the other overflow-counter
+  *values* tally capped events rather than distinct keys — both occur only
+  alongside nonzero degradation counters, so capped output is never mistaken
+  for canonical.
 - **Timestamp absence is typed, not faked** — a pcapng Simple Packet Block
   carries no timestamp, so `Record.ts` (and `PacketView.ts`) is
   `Option<Timestamp>`. SPB records are excluded from every first/last fold and

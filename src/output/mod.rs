@@ -149,6 +149,9 @@ pub struct Degradation {
     pub undecodable_records: u64,
     /// Well-framed pcapng packet blocks with malformed bodies, skipped.
     pub skipped_blocks: u64,
+    /// Packets belonging to flows beyond the `max_flows` cap — refused
+    /// packets plus the accumulated packets of evicted flows; exactly the
+    /// packets of flows missing from the report, in any packet order.
     pub flows_dropped: u64,
     pub assets_dropped: u64,
     pub bindings_dropped: u64,

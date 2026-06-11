@@ -66,12 +66,15 @@ Pass `-` as the capture argument to stream from stdin — no local disk needed:
 Memory stays constant either way.
 
 Analysis collections are hard-capped (`analysis::Limits`) so a hostile capture
-degrades instead of exhausting memory. Anything that degrades a run — a
-truncated tail, a corrupt mid-stream section header (concatenated pcapng),
-malformed blocks skipped, caps hit, records without timestamps (pcapng Simple
-Packet Blocks) — is reported as warnings on stderr and machine-readably in the
-`degradation` object of every `--json` envelope. Only a capture whose initial
-header is unreadable fails outright.
+degrades instead of exhausting memory. Caps evict deterministically — at a cap
+a new key is admitted only by evicting the largest admitted one, so the
+survivors are the N smallest keys of the capture and the same packets produce
+the same report in any arrival order, even cap-saturated. Anything that
+degrades a run — a truncated tail, a corrupt mid-stream section header
+(concatenated pcapng), malformed blocks skipped, caps hit, records without
+timestamps (pcapng Simple Packet Blocks) — is reported as warnings on stderr
+and machine-readably in the `degradation` object of every `--json` envelope.
+Only a capture whose initial header is unreadable fails outright.
 
 The degradation signal is also in-band in every output format, so a consumer
 that only sees stdout can still detect partial results:

@@ -211,7 +211,9 @@ impl Flow {
 pub struct FlowTable {
     flows: BTreeMap<FlowKey, Flow>,
     limits: Limits,
-    /// Flows dropped because the table was at `max_flows` — reported, not hidden.
+    /// Packets belonging to flows not retained at `max_flows` — refused
+    /// packets plus the accumulated packets of evicted flows. Reported, not
+    /// hidden.
     dropped: u64,
 }
 
@@ -236,10 +238,12 @@ impl FlowTable {
         }
     }
 
-    /// *Packets* that arrived for flows beyond the `max_flows` cap (the
-    /// flow-flood backstop). Counts untracked packets, not distinct flows —
-    /// distinguishing new flows would require remembering the keys the cap
-    /// exists to not store.
+    /// *Packets* that belong to flows not retained in the table (the
+    /// flow-flood backstop): packets refused while their key was beyond the
+    /// cap, plus the accumulated packets of flows evicted to keep the
+    /// survivor set deterministic. For a given packet set the value is
+    /// order-independent — it is exactly the packet count of the flows
+    /// missing from the final table.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped
@@ -310,21 +314,33 @@ impl Observe for FlowTable {
             Direction::BToA
         };
 
-        // Flow-flood backstop: once the table is full, keep updating flows we
-        // already track but stop minting new ones (counting the drop). A
-        // random-5-tuple SYN flood therefore costs a bounded table plus a
-        // counter, not unbounded memory. One map descent via Entry rather than
-        // a separate contains_key + entry.
+        // Flow-flood backstop: bounded memory AND order-independent
+        // survivors. At the cap a new key is admitted only if it sorts before
+        // the largest tracked key, which is evicted — so the table always
+        // holds the smallest `max_flows` keys of the capture's flow-key set,
+        // whatever order the packets arrived in. An evicted flow's
+        // accumulated packets join `dropped`, and each refused packet counts
+        // one, so `dropped` is exactly the packets of flows missing from the
+        // final table — itself order-independent. The extra descents
+        // (contains_key, last/pop) are paid only for a never-tracked key on a
+        // full table; under the cap the steady state stays one Entry descent.
         let len = self.flows.len();
+        if len >= self.limits.max_flows && !self.flows.contains_key(&key) {
+            if self
+                .flows
+                .last_key_value()
+                .is_none_or(|(largest, _)| key >= *largest)
+            {
+                self.dropped = self.dropped.saturating_add(1);
+                return;
+            }
+            if let Some((_, evicted)) = self.flows.pop_last() {
+                self.dropped = self.dropped.saturating_add(evicted.total_packets());
+            }
+        }
         let flow = match self.flows.entry(key) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => {
-                if len >= self.limits.max_flows {
-                    self.dropped = self.dropped.saturating_add(1);
-                    return;
-                }
-                e.insert(Flow::new(key, dir, pkt.ts))
-            }
+            Entry::Vacant(e) => e.insert(Flow::new(key, dir, pkt.ts)),
         };
 
         let stats = flow.stats_mut(dir);

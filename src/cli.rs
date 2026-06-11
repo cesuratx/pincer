@@ -376,7 +376,8 @@ impl Pass {
         }
         if self.flows.dropped() > 0 {
             warn(format!(
-                "flow table hit its cap; {} flow(s) dropped (results are partial)",
+                "flow table hit its cap; {} packet(s) of untracked flows dropped \
+                 (results are partial)",
                 self.flows.dropped()
             ));
         }
