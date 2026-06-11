@@ -157,6 +157,7 @@ impl Ipv4Stage {
             seq: 1000,
             ack: 0,
             flags: 0x18, // PSH+ACK default for data segments
+            options: Vec::new(),
         }
     }
 
@@ -229,6 +230,7 @@ impl Ipv6Stage {
             seq: 1000,
             ack: 0,
             flags: 0x18,
+            options: Vec::new(),
         }
     }
 
@@ -311,6 +313,7 @@ pub struct TcpStage {
     seq: u32,
     ack: u32,
     flags: u8,
+    options: Vec<u8>,
 }
 
 impl TcpStage {
@@ -357,6 +360,19 @@ impl TcpStage {
         self
     }
 
+    /// TCP options bytes, padded here to a 4-byte boundary (end-of-list
+    /// padding) and capped at the protocol maximum of 40. Raises the data
+    /// offset above 5 — real SYNs virtually always carry options, and the
+    /// decoder's offset arithmetic decides where the payload (and therefore
+    /// HTTP/TLS sniffing) begins.
+    #[must_use]
+    pub fn tcp_options(mut self, options: &[u8]) -> Self {
+        let mut padded = options.get(..options.len().min(40)).unwrap_or(&[]).to_vec();
+        padded.resize(padded.len().next_multiple_of(4).min(40), 0);
+        self.options = padded;
+        self
+    }
+
     /// Finish with no payload (handshake segments).
     #[must_use]
     pub fn build(self) -> Vec<u8> {
@@ -366,17 +382,20 @@ impl TcpStage {
     /// Finish the packet with this TCP payload.
     #[must_use]
     pub fn payload(self, data: &[u8]) -> Vec<u8> {
-        let tcp_len = len_u16(20 + data.len());
-        let mut tcp = Vec::with_capacity(20 + data.len());
+        let header_len = 20 + self.options.len();
+        let tcp_len = len_u16(header_len + data.len());
+        let mut tcp = Vec::with_capacity(header_len + data.len());
         tcp.extend_from_slice(&self.src_port.to_be_bytes());
         tcp.extend_from_slice(&self.dst_port.to_be_bytes());
         tcp.extend_from_slice(&self.seq.to_be_bytes());
         tcp.extend_from_slice(&self.ack.to_be_bytes());
-        tcp.push(0x50); // data offset 5 words
+        let offset_words = u8::try_from(header_len / 4).unwrap_or(5);
+        tcp.push(offset_words << 4);
         tcp.push(self.flags);
         tcp.extend_from_slice(&0xFFFFu16.to_be_bytes()); // window
         tcp.extend_from_slice(&[0, 0]); // checksum placeholder
         tcp.extend_from_slice(&[0, 0]); // urgent pointer
+        tcp.extend_from_slice(&self.options);
         tcp.extend_from_slice(data);
 
         match self.ip {
@@ -398,19 +417,23 @@ impl TcpStage {
 
 /// RFC 1071 one's-complement checksum over the given byte slices.
 fn internet_checksum(parts: &[&[u8]]) -> u16 {
-    let mut sum = 0u32;
+    // u64 accumulator: a u32 one overflows — and panics under
+    // overflow-checks — after ~128 KiB of 0xFF bytes, reachable through a
+    // large fixture payload. Overflowing u64 would take 2^48 16-bit words
+    // (half a petabyte), which cannot exist in memory.
+    let mut sum = 0u64;
     let mut leftover: Option<u8> = None;
     for part in parts {
         for &byte in *part {
             if let Some(high) = leftover.take() {
-                sum += u32::from(u16::from_be_bytes([high, byte]));
+                sum += u64::from(u16::from_be_bytes([high, byte]));
             } else {
                 leftover = Some(byte);
             }
         }
     }
     if let Some(high) = leftover {
-        sum += u32::from(u16::from_be_bytes([high, 0]));
+        sum += u64::from(u16::from_be_bytes([high, 0]));
     }
     while sum > 0xFFFF {
         sum = (sum & 0xFFFF) + (sum >> 16);
@@ -525,6 +548,8 @@ pub struct DhcpOptions<'a> {
     pub server_id: Option<Ipv4Addr>,
     /// DHCP option 1 — the real subnet mask, when set.
     pub subnet_mask: Option<Ipv4Addr>,
+    /// `giaddr` — marks the exchange as relayed from another segment.
+    pub relay_ip: Option<Ipv4Addr>,
 }
 
 /// BOOTP/DHCP payload with the given message type and options.
@@ -539,7 +564,8 @@ pub fn dhcp(msg_type: u8, client_mac: MacAddr, xid: u32, opts: &DhcpOptions<'_>)
     msg.extend_from_slice(&xid.to_be_bytes());
     msg.extend_from_slice(&[0u8; 8]); // secs, flags, ciaddr
     msg.extend_from_slice(&opts.your_ip.unwrap_or(Ipv4Addr::UNSPECIFIED).octets());
-    msg.extend_from_slice(&[0u8; 8]); // siaddr, giaddr
+    msg.extend_from_slice(&[0u8; 4]); // siaddr
+    msg.extend_from_slice(&opts.relay_ip.unwrap_or(Ipv4Addr::UNSPECIFIED).octets()); // giaddr
     msg.extend_from_slice(&client_mac.0);
     msg.extend_from_slice(&[0u8; 10]);
     msg.extend_from_slice(&[0u8; 192]); // sname + file

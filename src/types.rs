@@ -57,6 +57,11 @@ impl Timestamp {
 
     #[must_use]
     pub const fn new(secs: u64, nanos: u32) -> Self {
+        // Normalize: carry whole seconds out of `nanos`, so `nanos < 1e9` is
+        // a constructor-enforced invariant rather than an advisory one
+        // (`Display` and the pcap writer both rely on it).
+        let secs = secs.saturating_add((nanos / 1_000_000_000) as u64);
+        let nanos = nanos % 1_000_000_000;
         Self {
             secs: if secs > Self::MAX_SECS {
                 Self::MAX_SECS

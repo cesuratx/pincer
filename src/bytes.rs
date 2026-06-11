@@ -1,7 +1,9 @@
-//! Panic-free byte cursor — the single chokepoint for reading raw packet
-//! bytes. No other module may index or slice packet data; every accessor here
-//! is bounds-checked and returns `Result`, which is what makes the crate-wide
-//! "never panics on hostile input" claim provable.
+//! Panic-free byte cursor — the single chokepoint for *indexing or slicing*
+//! raw packet bytes; every accessor here is bounds-checked and returns
+//! `Result`, which is what makes the crate-wide "never panics on hostile
+//! input" claim provable. (A few consumers read the bytes it yields through
+//! safe std APIs — `str::from_utf8`, `windows()` — which cannot panic
+//! either; `clippy::indexing_slicing` is denied everywhere else.)
 #![deny(clippy::arithmetic_side_effects)]
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -9,7 +11,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use crate::error::DecodeError;
 use crate::types::MacAddr;
 
-#[derive(Debug, Clone, Copy)]
+// Deliberately NOT `Copy`: a callee that received the cursor by value would
+// silently advance its own copy while the caller's position stays put —
+// exactly the bug class the single-chokepoint design exists to prevent.
+#[derive(Debug, Clone)]
 pub struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
@@ -77,10 +82,12 @@ impl<'a> Cursor<'a> {
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
-        let slice = self.take(N)?;
-        let mut out = [0u8; N];
-        out.copy_from_slice(slice);
-        Ok(out)
+        // `try_into` keeps even this conversion provably panic-free (a
+        // `copy_from_slice` would panic on length mismatch — unreachable,
+        // but "unreachable" is a weaker proof than "no panic path exists").
+        self.take(N)?
+            .try_into()
+            .map_err(|_| DecodeError::truncated(N, 0))
     }
 
     pub fn u8(&mut self) -> Result<u8, DecodeError> {
@@ -158,6 +165,27 @@ mod tests {
         cur.skip(1).unwrap();
         assert_eq!(cur.rest(), &[2, 3]);
         assert_eq!(cur.rest(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn position_arithmetic_cannot_overflow() {
+        // pos + n overflowing usize must be an error, not a wrap-around.
+        let data = [0u8; 4];
+        let mut cur = Cursor::new(&data);
+        cur.skip(1).unwrap();
+        assert!(cur.take(usize::MAX).is_err());
+        assert_eq!(cur.pos(), 1, "failed take must not move the cursor");
+    }
+
+    #[test]
+    fn peek_and_skip_cover_their_edges() {
+        let data = [7u8, 8];
+        let mut cur = Cursor::new(&data);
+        assert_eq!(cur.peek_first(), Some(7));
+        assert_eq!(cur.pos(), 0, "peek must not consume");
+        cur.skip(2).unwrap();
+        assert_eq!(cur.peek_first(), None);
+        assert!(cur.skip(1).is_err());
     }
 
     #[test]
