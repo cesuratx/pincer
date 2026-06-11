@@ -234,7 +234,10 @@ impl FlowTable {
         }
     }
 
-    /// Flows discarded due to the `max_flows` cap (flow-flood backstop).
+    /// *Packets* that arrived for flows beyond the `max_flows` cap (the
+    /// flow-flood backstop). Counts untracked packets, not distinct flows —
+    /// distinguishing new flows would require remembering the keys the cap
+    /// exists to not store.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped
@@ -274,6 +277,10 @@ impl Observe for FlowTable {
             }
             Some(TransportView::Udp(udp)) => (udp.src_port, udp.dst_port, IpProto::Udp, None),
             Some(TransportView::Sctp(sctp)) => (sctp.src_port, sctp.dst_port, IpProto::Sctp, None),
+            // Representation choices: every ICMP type/code aggregates into
+            // one port-0 flow per host pair (types are diagnostics, not
+            // services), and ARP produces no flow at all (it is L2 chatter,
+            // visible to `assets`, not a conversation).
             Some(TransportView::Icmp(icmp)) => {
                 let proto = if icmp.v6 {
                     IpProto::IcmpV6

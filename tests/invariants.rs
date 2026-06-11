@@ -67,7 +67,9 @@ fn flow_direction_bytes_are_conserved() {
 
 /// Total bytes across all flows must equal the bytes the stats sink counted
 /// for the *same* packets (IP packets carrying a transport header). We compare
-/// against a stats run filtered to flow-eligible packets by re-deriving it.
+/// against an independently-accumulated total. (The oracle re-applies the
+/// same eligibility rule as the flow table — this checks the *accounting*,
+/// not the eligibility predicate itself.)
 #[test]
 fn flow_bytes_match_packet_bytes() {
     // Build a capture of only TCP/UDP packets so every packet yields a flow.
@@ -234,7 +236,9 @@ proptest! {
     /// decoder must survive intact (labels 1..=63, total under the cap).
     #[test]
     fn dns_name_round_trips(
-        labels in proptest::collection::vec("[a-z0-9]{1,15}", 1..5)
+        // Labels up to the 63-byte boundary; at most three so the assembled
+        // name stays under the 253-byte total cap the parser enforces.
+        labels in proptest::collection::vec("[a-z0-9]{1,63}", 1..4)
     ) {
         let name = labels.join(".");
         // Wrap the encoded name in a minimal A-record query and parse it.

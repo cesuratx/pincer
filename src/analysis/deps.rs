@@ -28,6 +28,13 @@ pub struct DepEdge {
 /// client/server/port into one edge. Client/server roles come from each
 /// flow's initiator heuristic; identities resolve through the inventory so a
 /// host keyed by MAC and by IP collapses to one node.
+///
+/// Known limitation: identity resolution uses the inventory's *final*
+/// IP→MAC bindings. If an IP changed hands mid-capture (DHCP churn, VRRP
+/// failover), all of its flows — including those from the earlier holder —
+/// attribute to the final one. The inventory counts these as
+/// `AssetOverflow::rebound_ips` and the CLI surfaces them in the degradation
+/// report, so the ambiguity is visible rather than silent.
 #[must_use]
 pub fn dependency_edges(flows: &FlowTable, inventory: &AssetInventory) -> Vec<DepEdge> {
     use std::collections::BTreeMap;

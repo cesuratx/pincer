@@ -1,5 +1,6 @@
 //! Capture-wide counters: packet/byte totals, protocol breakdown, time span,
 //! and parse-anomaly tallies (the honest "what we couldn't decode" view).
+#![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::BTreeMap;
 
@@ -26,6 +27,9 @@ pub struct Stats {
     /// Records that never became a packet view: non-Ethernet link
     /// type, or an Ethernet header too broken to read.
     pub undecodable: u64,
+    /// Well-framed pcapng packet blocks whose bodies were malformed; each
+    /// was skipped by the reader instead of aborting the stream.
+    pub skipped_blocks: u64,
 }
 
 impl Stats {
@@ -44,7 +48,8 @@ impl Stats {
     }
 
     fn bump(map: &mut BTreeMap<&'static str, u64>, key: &'static str) {
-        *map.entry(key).or_insert(0) += 1;
+        let count = map.entry(key).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     /// A layer that failed to decode is an anomaly — but a header cut short by
@@ -127,5 +132,9 @@ impl Observe for Stats {
 impl Stats {
     pub fn note_undecodable(&mut self) {
         self.undecodable = self.undecodable.saturating_add(1);
+    }
+
+    pub fn note_skipped_blocks(&mut self, n: u64) {
+        self.skipped_blocks = self.skipped_blocks.saturating_add(n);
     }
 }

@@ -27,9 +27,15 @@ pub trait Observe {
 ///
 /// A hostile capture (random 5-tuple flood, ARP-spoof storm, mDNS name flood)
 /// must degrade into bounded memory with an honest "dropped N" counter, never
-/// an OOM. Defaults are generous for real networks (a /16 enterprise segment
-/// fits) yet bound the worst case to well under a gigabyte. Configurable so
-/// tests can drive overflow with tiny inputs.
+/// an OOM. Two layers enforce that: every stored name is length-capped at
+/// parse time (≤ 253 bytes, the DNS maximum — longer SNI/Host values are
+/// discarded as bogus), and every collection is entry-capped below. Defaults
+/// are generous for real networks (a /16 enterprise segment fits). The caps
+/// multiply, so saturating them all simultaneously is theoretically tens of
+/// GB — but only an input of comparable size can do that, since every
+/// retained byte must first arrive in a packet. Lower the caps when analyzing
+/// untrusted multi-GB captures; they are configurable, which also lets tests
+/// drive overflow with tiny inputs.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub max_flows: usize,
@@ -114,5 +120,8 @@ pub fn service_name(port: u16) -> Option<&'static str> {
 /// infer flow direction and to record services, so the rule lives in one place.
 #[must_use]
 pub fn is_service_port(port: u16) -> bool {
-    port < 1024 || service_name(port).is_some()
+    // Port 0 is reserved, never a listening service — without this bound a
+    // crafted zero-port packet acts as a well-known port in direction
+    // inference and creates phantom port-0 "services".
+    (1..1024).contains(&port) || service_name(port).is_some()
 }

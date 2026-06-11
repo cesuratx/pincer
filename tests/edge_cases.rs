@@ -82,7 +82,13 @@ fn hostname_before_arp_binding_is_not_orphaned() {
 fn asset_inventory_is_order_independent() {
     use pincer::fixtures::scenarios;
 
-    type AssetRow = (String, Vec<String>, Vec<(u16, String)>);
+    type AssetRow = (
+        String,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<(u16, String)>,
+    );
     let summarize = |frames: &[(Timestamp, Vec<u8>)]| -> Vec<AssetRow> {
         let mut inv = AssetInventory::new();
         for (i, (_, frame)) in frames.iter().enumerate() {
@@ -104,7 +110,13 @@ fn asset_inventory_is_order_independent() {
                     .map(|s| (s.port, format!("{:?}", s.evidence)))
                     .collect();
                 svcs.sort();
-                (a.key.to_string(), names, svcs)
+                // Identity fields too: a merge bug that scrambles which
+                // MACs/IPs belong to which asset must fail this fingerprint.
+                let mut ips: Vec<String> = a.ips.iter().map(ToString::to_string).collect();
+                ips.sort();
+                let mut macs: Vec<String> = a.macs.iter().map(ToString::to_string).collect();
+                macs.sort();
+                (a.key.to_string(), ips, macs, names, svcs)
             })
             .collect();
         rows.sort();
