@@ -2,6 +2,7 @@
 //!
 //! First-segment only by design: we do not reassemble TCP streams, and in
 //! practice the request line and Host header sit in the first data segment.
+//! Only the first 2 KiB of that segment are examined (`SCAN_LIMIT`).
 #![deny(clippy::arithmetic_side_effects)]
 
 use serde::Serialize;
@@ -25,12 +26,20 @@ pub struct HttpRequest {
 #[must_use]
 pub fn parse_request(payload: &[u8]) -> Option<HttpRequest> {
     let window = payload.get(..payload.len().min(SCAN_LIMIT))?;
-    let text = std::str::from_utf8(window).ok().or_else(|| {
-        // If the window's final byte split a multi-byte UTF-8 sequence (common
+    // Bound the UTF-8 requirement to the *header* region (up to the blank
+    // line): a POST whose binary body starts inside the first segment must
+    // not hide its own request line and Host header.
+    let headers = window
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .and_then(|end| window.get(..end.checked_add(4)?))
+        .unwrap_or(window);
+    let text = std::str::from_utf8(headers).ok().or_else(|| {
+        // If the region's final byte split a multi-byte UTF-8 sequence (common
         // when SCAN_LIMIT or the payload cuts mid-character), retry one byte
         // shorter. This is only a 1-byte trim, not general binary tolerance —
         // a request line and Host header are ASCII, so that suffices.
-        std::str::from_utf8(window.get(..window.len().checked_sub(1)?)?).ok()
+        std::str::from_utf8(headers.get(..headers.len().checked_sub(1)?)?).ok()
     })?;
 
     let (request_line, rest) = text.split_once("\r\n")?;
@@ -47,17 +56,34 @@ pub fn parse_request(payload: &[u8]) -> Option<HttpRequest> {
         .take_while(|line| !line.is_empty())
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
+            let value = value.trim();
             // Sanitize: the Host value can carry control/escape bytes that must
             // not reach a terminal/DOT cell unescaped (as DNS/DHCP names are).
-            name.eq_ignore_ascii_case("host")
-                .then(|| crate::app::sanitize_name(value.trim()))
+            // Length-cap: longer than any legal hostname ⇒ not evidence.
+            let value = normalize_host(value);
+            (name.eq_ignore_ascii_case("host") && value.len() <= crate::app::MAX_NAME_LEN)
+                .then(|| crate::app::sanitize_name(value))
         });
 
     Some(HttpRequest {
         method: method.to_string(),
-        path: path.to_string(),
+        // Same sanitation as every other attacker-controlled string that can
+        // reach a terminal or a report cell.
+        path: crate::app::sanitize_name(path),
         host,
     })
+}
+
+/// Strip a `:port` suffix (and the brackets of an IPv6 literal) so the stored
+/// hostname matches what DNS/TLS evidence calls the same server.
+fn normalize_host(value: &str) -> &str {
+    if let Some(rest) = value.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(ip, _)| ip);
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => value,
+    }
 }
 
 #[cfg(test)]
@@ -73,6 +99,35 @@ mod tests {
         assert_eq!(parsed.method, "GET");
         assert_eq!(parsed.path, "/status");
         assert_eq!(parsed.host.as_deref(), Some("intranet.local"));
+    }
+
+    #[test]
+    fn binary_body_in_first_segment_does_not_hide_the_request() {
+        // A POST whose body starts within the 2 KiB window and is not UTF-8:
+        // the headers are what matter, and they are clean.
+        let mut req = b"POST /upload HTTP/1.1\r\nHost: files.local\r\n\r\n".to_vec();
+        req.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x80, 0xC3, 0x28]); // invalid UTF-8
+        let parsed = parse_request(&req).unwrap();
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.host.as_deref(), Some("files.local"));
+    }
+
+    #[test]
+    fn host_port_suffix_and_ipv6_brackets_are_normalized() {
+        let req = b"GET / HTTP/1.1\r\nHost: files.local:8080\r\n\r\n";
+        assert_eq!(
+            parse_request(req).unwrap().host.as_deref(),
+            Some("files.local")
+        );
+        let req = b"GET / HTTP/1.1\r\nHost: [::1]:443\r\n\r\n";
+        assert_eq!(parse_request(req).unwrap().host.as_deref(), Some("::1"));
+    }
+
+    #[test]
+    fn oversized_host_is_not_hostname_evidence() {
+        let req = format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", "a".repeat(300));
+        let parsed = parse_request(req.as_bytes()).unwrap();
+        assert_eq!(parsed.host, None);
     }
 
     #[test]

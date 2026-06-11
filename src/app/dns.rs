@@ -20,7 +20,10 @@ pub const TYPE_PTR: u16 = 12;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_SRV: u16 = 33;
 
-/// Sanity caps for hostile counts/structures.
+/// Walk caps: bound the per-message work (name decompression per entry) a
+/// hostile flood can demand. Exceeding a cap does NOT reject the message —
+/// entries are parsed up to the cap and the rest are dropped, keeping the
+/// evidence a legitimate oversized mDNS burst carries.
 const MAX_QUESTIONS: u16 = 32;
 const MAX_RECORDS: u16 = 128;
 const MAX_POINTER_JUMPS: u8 = 16;
@@ -74,15 +77,19 @@ fn parse_inner(msg: &[u8], is_mdns: bool) -> Result<DnsSummary, DecodeError> {
     let ns_count = cur.u16_be()?;
     let extra_count = cur.u16_be()?;
 
-    if qd_count > MAX_QUESTIONS {
-        return Err(DecodeError::malformed("dns", "implausible question count"));
-    }
-    let record_total = an_count
-        .saturating_add(ns_count)
-        .saturating_add(extra_count);
-    if record_total > MAX_RECORDS {
-        return Err(DecodeError::malformed("dns", "implausible record count"));
-    }
+    // Keep-what-we-have at the caps, never reject the whole message (real
+    // mDNS bursts legitimately exceed them). Records sit *after* the question
+    // section, so when the question count overflows its cap the records can
+    // no longer be located — evidence then stops at the parsed questions.
+    let walk_questions = qd_count.min(MAX_QUESTIONS);
+    let record_total = if qd_count > MAX_QUESTIONS {
+        0
+    } else {
+        an_count
+            .saturating_add(ns_count)
+            .saturating_add(extra_count)
+            .min(MAX_RECORDS)
+    };
     // Opcode must be QUERY(0) for anything we care about.
     if (flags >> 11) & 0x0F != 0 {
         return Err(DecodeError::malformed("dns", "non-query opcode"));
@@ -96,7 +103,7 @@ fn parse_inner(msg: &[u8], is_mdns: bool) -> Result<DnsSummary, DecodeError> {
         answers: Vec::new(),
     };
 
-    for _ in 0..qd_count {
+    for _ in 0..walk_questions {
         let (name, next) = parse_name(msg, cur.pos(), msg.len())?;
         cur = Cursor::at(msg, next)?;
         let qtype = cur.u16_be()?;
@@ -111,14 +118,19 @@ fn parse_inner(msg: &[u8], is_mdns: bool) -> Result<DnsSummary, DecodeError> {
         let (name, next) = parse_name(msg, cur.pos(), msg.len())?;
         cur = Cursor::at(msg, next)?;
         let rtype = cur.u16_be()?;
-        cur.u16_be()?; // class / cache-flush bit
+        let class = cur.u16_be()?;
         cur.u32_be()?; // ttl
         let rd_len = usize::from(cur.u16_be()?);
         let rdata_start = cur.pos();
         let rdata = cur.take(rd_len)?;
 
         // Answers and additionals carry naming evidence; authority does not.
-        let keep = index < an_count || index >= an_count.saturating_add(ns_count);
+        // Nor do EDNS OPT pseudo-records (rtype 41, whose "class" is a UDP
+        // size) or non-IN classes — the top class bit is mDNS cache-flush,
+        // not part of the class number.
+        let keep = (index < an_count || index >= an_count.saturating_add(ns_count))
+            && rtype != 41
+            && class & 0x7FFF == 1;
         if !keep {
             continue;
         }
@@ -189,6 +201,12 @@ fn parse_name(
 
         match len & 0xC0 {
             0xC0 => {
+                // Both pointer bytes must lie within the current bound —
+                // without this, the second byte could be read one past a
+                // record's declared RDATA end.
+                if pos.saturating_add(1) >= bound {
+                    return Err(DecodeError::malformed("dns", "name runs past its record"));
+                }
                 let low = cur.u8()?;
                 let target = usize::from(len & 0x3F) << 8 | usize::from(low);
                 // Pointers must go strictly backwards — kills loops outright.
@@ -221,7 +239,15 @@ fn parse_name(
                     return Err(DecodeError::malformed("dns", "label runs past its record"));
                 }
                 let label = cur.take(usize::from(len))?;
-                if name.len().saturating_add(usize::from(len)) > MAX_NAME_LEN {
+                // Count the separating dot too, so the assembled name really
+                // is capped at 253 — not 254 by an off-by-one.
+                let sep = usize::from(!name.is_empty());
+                if name
+                    .len()
+                    .saturating_add(sep)
+                    .saturating_add(usize::from(len))
+                    > MAX_NAME_LEN
+                {
                     return Err(DecodeError::malformed("dns", "name too long"));
                 }
                 if !name.is_empty() {
@@ -278,6 +304,48 @@ mod tests {
             DnsRData::A(ip) => assert_eq!(ip, Ipv4Addr::new(93, 184, 216, 34)),
             ref other => panic!("expected A record, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_record_count_keeps_what_we_have() {
+        // Header claims 500 answers; only two are actually present. The old
+        // behavior rejected the whole message ("implausible record count"),
+        // losing both real records.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0x1234u16.to_be_bytes()); // id
+        msg.extend_from_slice(&0x8400u16.to_be_bytes()); // response flags
+        msg.extend_from_slice(&0u16.to_be_bytes()); // qd
+        msg.extend_from_slice(&500u16.to_be_bytes()); // an: a lie
+        msg.extend_from_slice(&0u16.to_be_bytes()); // ns
+        msg.extend_from_slice(&0u16.to_be_bytes()); // ar
+        for ip in [[10, 0, 0, 1], [10, 0, 0, 2]] {
+            msg.extend_from_slice(&[1, b'a', 5, b'l', b'o', b'c', b'a', b'l', 0]);
+            msg.extend_from_slice(&1u16.to_be_bytes()); // A
+            msg.extend_from_slice(&1u16.to_be_bytes()); // IN
+            msg.extend_from_slice(&120u32.to_be_bytes()); // ttl
+            msg.extend_from_slice(&4u16.to_be_bytes()); // rd_len
+            msg.extend_from_slice(&ip);
+        }
+        let summary = parse(&msg, false).unwrap();
+        assert_eq!(summary.answers.len(), 2, "real records must survive");
+    }
+
+    #[test]
+    fn oversized_question_count_keeps_the_cap() {
+        // 100 questions: the first MAX_QUESTIONS are kept, the message is
+        // not rejected.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0x4242u16.to_be_bytes());
+        msg.extend_from_slice(&0u16.to_be_bytes()); // query flags
+        msg.extend_from_slice(&100u16.to_be_bytes()); // qd
+        msg.extend_from_slice(&[0u8; 6]); // an, ns, ar
+        for _ in 0..100 {
+            msg.extend_from_slice(&[1, b'q', 0]); // "q."
+            msg.extend_from_slice(&1u16.to_be_bytes());
+            msg.extend_from_slice(&1u16.to_be_bytes());
+        }
+        let summary = parse(&msg, false).unwrap();
+        assert_eq!(summary.queries.len(), usize::from(MAX_QUESTIONS));
     }
 
     #[test]

@@ -81,6 +81,10 @@ pub struct DhcpSummary {
     /// Option 1 — the subnet mask the server hands out (OFFER/ACK). Lets the
     /// asset inventory learn the *real* local segment size, not a /24 guess.
     pub subnet_mask: Option<Ipv4Addr>,
+    /// `giaddr` — set when a relay forwarded this exchange from *another*
+    /// segment: the client MAC and subnet then describe an off-link network,
+    /// not the captured one.
+    pub relay_ip: Option<Ipv4Addr>,
     pub hostname: Option<String>,
     pub vendor_class: Option<String>,
     /// Option 55 codes in request order — the device fingerprint.
@@ -120,7 +124,7 @@ fn parse_inner(payload: &[u8]) -> Result<DhcpSummary, DecodeError> {
     cur.ipv4()?; // ciaddr
     let yiaddr = cur.ipv4()?;
     cur.ipv4()?; // siaddr
-    cur.ipv4()?; // giaddr
+    let giaddr = cur.ipv4()?;
     let client_mac = cur.mac()?;
     cur.skip(10)?; // rest of chaddr
     cur.skip(64)?; // sname
@@ -137,6 +141,7 @@ fn parse_inner(payload: &[u8]) -> Result<DhcpSummary, DecodeError> {
         requested_ip: None,
         server_id: None,
         subnet_mask: None,
+        relay_ip: (!giaddr.is_unspecified()).then_some(giaddr),
         hostname: None,
         vendor_class: None,
         param_req_list: Vec::new(),
@@ -174,6 +179,8 @@ fn parse_inner(payload: &[u8]) -> Result<DhcpSummary, DecodeError> {
     Ok(summary)
 }
 
+/// Like `app::sanitize_name`, plus the space character — DHCP option values
+/// (vendor class "MSFT 5.0") legitimately contain one; hostnames do not.
 fn printable(bytes: &[u8]) -> String {
     bytes
         .iter()
